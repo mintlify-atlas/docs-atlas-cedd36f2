@@ -1,0 +1,954 @@
+---
+title: "chi Middleware Reference: All Built-in Handlers"
+sidebarTitle: "Middleware"
+description: "Complete reference for all middleware in chi/v5/middleware — logging, recovery, throttle, compression, basic auth, IP detection, and utilities."
+---
+
+The `middleware` package ships a comprehensive set of production-ready HTTP middleware handlers that compose cleanly with any `chi` router. Each handler follows the standard `func(next http.Handler) http.Handler` signature, so they slot into `r.Use(...)` or inline `r.With(...).Get(...)` chains with zero ceremony. Import the package once and mix in only what your application needs.
+
+```go
+import "github.com/go-chi/chi/v5/middleware"
+```
+
+---
+
+## Logging & Observability
+
+<Accordion title="Logger">
+
+```go
+func Logger(next http.Handler) http.Handler
+```
+
+Logs the start and end of every request, including method, URL, remote address, response status, bytes written, and elapsed time. Output is colorized when stdout is a TTY. Prints the request ID when one is present in context.
+
+<Note>
+`Logger` delegates to `middleware.DefaultLogger`, which is a package-level variable. You can swap it for a custom `LogFormatter` at startup without changing your router wiring.
+</Note>
+
+<Warning>
+Place `Logger` **before** `Recoverer` in your middleware stack so that panics are logged correctly against the right request entry.
+</Warning>
+
+**Example**
+
+```go
+r := chi.NewRouter()
+r.Use(middleware.Logger)     // must come before Recoverer
+r.Use(middleware.Recoverer)
+r.Get("/", homeHandler)
+```
+
+</Accordion>
+
+<Accordion title="RequestLogger">
+
+```go
+func RequestLogger(f LogFormatter) func(next http.Handler) http.Handler
+```
+
+Creates a logger middleware driven by a custom `LogFormatter`. Use this when you need structured logging (JSON, zerolog, zap, etc.) instead of the default plaintext format.
+
+<ParamField path="f" type="LogFormatter" required>
+  A value implementing `LogFormatter`. Its `NewLogEntry(r *http.Request) LogEntry` method is called at the start of each request, and the returned `LogEntry.Write(...)` is deferred to run after the handler finishes.
+</ParamField>
+
+**Key interfaces**
+
+```go
+type LogFormatter interface {
+    NewLogEntry(r *http.Request) LogEntry
+}
+
+type LogEntry interface {
+    Write(status, bytes int, header http.Header, elapsed time.Duration, extra interface{})
+    Panic(v interface{}, stack []byte)
+}
+```
+
+**Example**
+
+```go
+// Use the built-in formatter with a custom logger
+logger := &middleware.DefaultLogFormatter{
+    Logger:  log.New(os.Stdout, "", log.LstdFlags),
+    NoColor: true,
+}
+r.Use(middleware.RequestLogger(logger))
+```
+
+</Accordion>
+
+<Accordion title="RequestID">
+
+```go
+func RequestID(next http.Handler) http.Handler
+```
+
+Injects a unique request ID into the request context for every incoming request. If the incoming request already carries an `X-Request-Id` header, that value is reused; otherwise a new ID of the form `hostname/random-000001` is generated using an atomic counter.
+
+Retrieve the ID anywhere downstream with:
+
+```go
+id := middleware.GetReqID(r.Context())
+```
+
+<Tip>
+Override `middleware.RequestIDHeader` (default `"X-Request-Id"`) to accept a different header name from your proxy.
+</Tip>
+
+**Example**
+
+```go
+r := chi.NewRouter()
+r.Use(middleware.RequestID)
+r.Use(middleware.Logger) // Logger will print the request ID automatically
+
+r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+    id := middleware.GetReqID(r.Context())
+    w.Header().Set("X-Request-Id", id)
+    w.Write([]byte("ok"))
+})
+```
+
+</Accordion>
+
+<Accordion title="Heartbeat">
+
+```go
+func Heartbeat(endpoint string) func(http.Handler) http.Handler
+```
+
+Registers a lightweight health-check endpoint that responds `200 OK` with a `"."` body to all `GET` and `HEAD` requests at the given path. All other requests pass through unaffected. Place this above authentication middleware so load balancers and uptime monitors can reach it without credentials.
+
+<ParamField path="endpoint" type="string" required>
+  The URL path to intercept, e.g. `"/ping"` or `"/healthz"`.
+</ParamField>
+
+**Example**
+
+```go
+r := chi.NewRouter()
+r.Use(middleware.Heartbeat("/ping"))
+r.Use(authMiddleware) // heartbeat is already handled above
+r.Get("/", appHandler)
+```
+
+</Accordion>
+
+<Accordion title="Profiler">
+
+```go
+func Profiler() http.Handler
+```
+
+Returns a subrouter pre-wired with all `net/http/pprof` handlers and the `expvar` endpoint. Mount it under a protected path — never expose it on the public internet.
+
+The profiler registers these routes relative to its mount prefix:
+
+| Path | Handler |
+|---|---|
+| `/pprof/` | Index |
+| `/pprof/cmdline` | Cmdline |
+| `/pprof/profile` | CPU profile |
+| `/pprof/symbol` | Symbol lookup |
+| `/pprof/trace` | Execution trace |
+| `/pprof/goroutine` | Goroutine dump |
+| `/pprof/heap` | Heap profile |
+| `/pprof/block` | Block profile |
+| `/pprof/mutex` | Mutex profile |
+| `/pprof/allocs` | Allocs profile |
+| `/vars` | expvar handler |
+
+<Warning>
+`Profiler` is excluded when building with the `tinygo` toolchain (`//go:build !tinygo`).
+</Warning>
+
+**Example**
+
+```go
+func MyService() http.Handler {
+    r := chi.NewRouter()
+    // Mount behind an internal-only prefix
+    r.Mount("/debug", middleware.Profiler())
+    r.Get("/", appHandler)
+    return r
+}
+```
+
+</Accordion>
+
+---
+
+## Resilience
+
+<Accordion title="Recoverer">
+
+```go
+func Recoverer(next http.Handler) http.Handler
+```
+
+Recovers from panics in downstream handlers, logs a colorized stack trace to stderr, and writes `HTTP 500` to the client. Prints the request ID (if available) alongside the stack. Re-panics `http.ErrAbortHandler` so connection abort semantics are preserved.
+
+<Warning>
+Always place `Recoverer` **after** `Logger` in your middleware chain so that the log entry is finalized before `Recoverer` writes the 500 response.
+</Warning>
+
+**Example**
+
+```go
+r := chi.NewRouter()
+r.Use(middleware.Logger)
+r.Use(middleware.Recoverer)
+
+r.Get("/boom", func(w http.ResponseWriter, r *http.Request) {
+    panic("something went very wrong")
+})
+```
+
+</Accordion>
+
+<Accordion title="Timeout">
+
+```go
+func Timeout(timeout time.Duration) func(next http.Handler) http.Handler
+```
+
+Cancels the request context after the specified duration and writes `HTTP 504 Gateway Timeout` if the deadline was exceeded. Handlers **must** respect `ctx.Done()` for the cancellation to take effect — the middleware only cancels the context; it cannot forcibly terminate a handler that ignores it.
+
+<ParamField path="timeout" type="time.Duration" required>
+  Maximum time the handler is allowed to run before context cancellation. Example: `30 * time.Second`.
+</ParamField>
+
+<Warning>
+If your handler ignores `ctx.Done()`, a 504 header will still be written, but the handler goroutine will continue running in the background until it returns.
+</Warning>
+
+**Example**
+
+```go
+r := chi.NewRouter()
+r.Use(middleware.Timeout(30 * time.Second))
+
+r.Get("/slow", func(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    select {
+    case <-ctx.Done():
+        return // timeout fired
+    case <-time.After(5 * time.Second):
+        w.Write([]byte("done"))
+    }
+})
+```
+
+</Accordion>
+
+<Accordion title="Throttle">
+
+```go
+func Throttle(limit int) func(http.Handler) http.Handler
+```
+
+Limits the number of concurrently processed requests to `limit`. Excess requests that exceed the ceiling receive `HTTP 429 Too Many Requests`. This is a server-wide concurrency ceiling, not a per-user rate limiter.
+
+<ParamField path="limit" type="int" required>
+  Maximum number of in-flight requests allowed simultaneously. Must be `>= 1`.
+</ParamField>
+
+**Example**
+
+```go
+r := chi.NewRouter()
+r.Use(middleware.Throttle(100)) // at most 100 concurrent requests
+r.Get("/", handler)
+```
+
+</Accordion>
+
+<Accordion title="ThrottleBacklog">
+
+```go
+func ThrottleBacklog(limit, backlogLimit int, backlogTimeout time.Duration) func(http.Handler) http.Handler
+```
+
+Extends `Throttle` with a waiting queue. Requests that exceed `limit` are held in the backlog (up to `backlogLimit` additional requests) and served as capacity frees up. Requests that wait longer than `backlogTimeout` receive `HTTP 429`.
+
+<ParamField path="limit" type="int" required>
+  Maximum number of concurrently active requests.
+</ParamField>
+<ParamField path="backlogLimit" type="int" required>
+  Maximum number of requests that may queue while waiting for an active slot.
+</ParamField>
+<ParamField path="backlogTimeout" type="time.Duration" required>
+  How long a queued request waits before being rejected with 429.
+</ParamField>
+
+**Example**
+
+```go
+r.Use(middleware.ThrottleBacklog(10, 50, 30*time.Second))
+```
+
+</Accordion>
+
+<Accordion title="ThrottleWithOpts">
+
+```go
+func ThrottleWithOpts(opts ThrottleOpts) func(http.Handler) http.Handler
+```
+
+Full-control throttle configuration via a `ThrottleOpts` struct. Supports custom status codes and a `Retry-After` header callback.
+
+```go
+type ThrottleOpts struct {
+    RetryAfterFn   func(ctxDone bool) time.Duration
+    Limit          int
+    BacklogLimit   int
+    BacklogTimeout time.Duration
+    StatusCode     int
+}
+```
+
+<ParamField path="opts.Limit" type="int" required>
+  Maximum concurrent in-flight requests. Must be `>= 1`.
+</ParamField>
+<ParamField path="opts.BacklogLimit" type="int">
+  Size of the waiting queue (0 = no queue).
+</ParamField>
+<ParamField path="opts.BacklogTimeout" type="time.Duration">
+  Maximum time a queued request waits. Defaults to 60 seconds.
+</ParamField>
+<ParamField path="opts.StatusCode" type="int">
+  HTTP status code returned when capacity is exceeded. Defaults to `429`.
+</ParamField>
+<ParamField path="opts.RetryAfterFn" type="func(ctxDone bool) time.Duration">
+  Optional function that returns the `Retry-After` duration. `ctxDone` is `true` when the client disconnected.
+</ParamField>
+
+**Example**
+
+```go
+r.Use(middleware.ThrottleWithOpts(middleware.ThrottleOpts{
+    Limit:          20,
+    BacklogLimit:   100,
+    BacklogTimeout: 10 * time.Second,
+    StatusCode:     503,
+    RetryAfterFn: func(ctxDone bool) time.Duration {
+        return 5 * time.Second
+    },
+}))
+```
+
+</Accordion>
+
+---
+
+## Request & Content
+
+<Accordion title="AllowContentType">
+
+```go
+func AllowContentType(contentTypes ...string) func(http.Handler) http.Handler
+```
+
+Enforces a whitelist of acceptable `Content-Type` values on incoming requests. Requests with a body whose `Content-Type` does not match any entry in the list receive `HTTP 415 Unsupported Media Type`. Requests with an empty body (`Content-Length: 0`) bypass the check.
+
+<ParamField path="contentTypes" type="...string" required>
+  One or more MIME types to permit, e.g. `"application/json"`, `"text/xml"`. Matching is case-insensitive; charset parameters are stripped before comparison.
+</ParamField>
+
+**Example**
+
+```go
+r.Use(middleware.AllowContentType("application/json", "application/xml"))
+r.Post("/api/data", handleData)
+```
+
+</Accordion>
+
+<Accordion title="AllowContentEncoding">
+
+```go
+func AllowContentEncoding(contentEncodings ...string) func(next http.Handler) http.Handler
+```
+
+Enforces a whitelist of acceptable `Content-Encoding` values. All encodings declared in the request header must appear in the allowed list, otherwise the request is rejected with `HTTP 415`. Empty-body requests are skipped.
+
+<ParamField path="contentEncodings" type="...string" required>
+  Encoding names to permit, e.g. `"gzip"`, `"identity"`. Matching is case-insensitive.
+</ParamField>
+
+**Example**
+
+```go
+r.Use(middleware.AllowContentEncoding("gzip", "identity"))
+```
+
+</Accordion>
+
+<Accordion title="ContentCharset">
+
+```go
+func ContentCharset(charsets ...string) func(next http.Handler) http.Handler
+```
+
+Validates that the `charset` parameter within the `Content-Type` header matches one of the provided values. Responds with `HTTP 415` on mismatch. Passing an empty string (`""`) as one of the charsets allows requests that carry no charset specification.
+
+<ParamField path="charsets" type="...string" required>
+  Charset values to permit, e.g. `"utf-8"`, `"iso-8859-1"`. Matching is case-insensitive.
+</ParamField>
+
+**Example**
+
+```go
+r.Use(middleware.ContentCharset("utf-8", ""))
+```
+
+</Accordion>
+
+<Accordion title="Compress">
+
+```go
+func Compress(level int, types ...string) func(next http.Handler) http.Handler
+```
+
+Compresses response bodies using `gzip` or `deflate` based on the client's `Accept-Encoding` header. Only responses whose `Content-Type` is in the allowed list are compressed. When no `types` are supplied, the default list covers common text and JavaScript types.
+
+<ParamField path="level" type="int" required>
+  Compression level as defined in the `compress/flate` package. Use `5` as a sensible default, `flate.BestSpeed` for lower CPU cost, or `flate.BestCompression` for maximum ratio.
+</ParamField>
+<ParamField path="types" type="...string">
+  MIME types to compress. Supports wildcard suffixes such as `"text/*"`. If omitted, the built-in list (`text/html`, `text/css`, `application/json`, `image/svg+xml`, and others) is used.
+</ParamField>
+
+<Note>
+Your handler must set `Content-Type` before writing the response body, otherwise the middleware cannot determine whether to compress the output.
+</Note>
+
+**Example**
+
+```go
+// Compress all default content types at level 5
+r.Use(middleware.Compress(5))
+
+// Compress only JSON at best speed
+r.Use(middleware.Compress(flate.BestSpeed, "application/json"))
+```
+
+**Custom encoder (Brotli example)**
+
+```go
+compressor := middleware.NewCompressor(5, "text/html")
+compressor.SetEncoder("br", func(w io.Writer, level int) io.Writer {
+    params := brotli_enc.NewBrotliParams()
+    params.SetQuality(level)
+    return brotli_enc.NewBrotliWriter(params, w)
+})
+r.Use(compressor.Handler)
+```
+
+</Accordion>
+
+<Accordion title="SetHeader">
+
+```go
+func SetHeader(key, value string) func(http.Handler) http.Handler
+```
+
+Sets a fixed response header key/value pair for every request passing through the middleware. Useful for adding security headers, CORS headers, or custom server identifiers globally.
+
+<ParamField path="key" type="string" required>
+  The HTTP response header name, e.g. `"X-Content-Type-Options"`.
+</ParamField>
+<ParamField path="value" type="string" required>
+  The value to assign to the header.
+</ParamField>
+
+**Example**
+
+```go
+r.Use(middleware.SetHeader("X-Content-Type-Options", "nosniff"))
+r.Use(middleware.SetHeader("X-Frame-Options", "DENY"))
+```
+
+</Accordion>
+
+---
+
+## Path & URL
+
+<Accordion title="StripSlashes">
+
+```go
+func StripSlashes(next http.Handler) http.Handler
+```
+
+Strips trailing slashes from the request path before routing continues. If a route matches the trimmed path, the handler is served. The original `r.URL.Path` is modified in-place when no chi route context is present; otherwise `rctx.RoutePath` is updated.
+
+**Example**
+
+```go
+r := chi.NewRouter()
+r.Use(middleware.StripSlashes)
+r.Get("/about", aboutHandler) // matches /about AND /about/
+```
+
+</Accordion>
+
+<Accordion title="RedirectSlashes">
+
+```go
+func RedirectSlashes(next http.Handler) http.Handler
+```
+
+Redirects any request whose path ends with a trailing slash to the same path without it, using `HTTP 301 Moved Permanently`. Query strings are preserved in the redirect target.
+
+<Warning>
+`RedirectSlashes` is **incompatible** with `http.FileServer`. See [issue #343](https://github.com/go-chi/chi/issues/343) for context.
+</Warning>
+
+**Example**
+
+```go
+r.Use(middleware.RedirectSlashes)
+r.Get("/docs", docsHandler) // /docs/ redirects to /docs
+```
+
+</Accordion>
+
+<Accordion title="CleanPath">
+
+```go
+func CleanPath(next http.Handler) http.Handler
+```
+
+Collapses duplicate slashes in request paths before routing. For example, `/users//1` and `////users////1` are both normalised to `/users/1`. Operates on `rctx.RoutePath` when a chi route context is present.
+
+**Example**
+
+```go
+r.Use(middleware.CleanPath)
+r.Get("/users/{id}", getUser) // also matches /users//42
+```
+
+</Accordion>
+
+<Accordion title="URLFormat">
+
+```go
+func URLFormat(next http.Handler) http.Handler
+```
+
+Extracts the file extension from the final path segment (e.g. `.json` from `/articles/1.json`), stores it as a string under `middleware.URLFormatCtxKey` in the request context, and strips the suffix from the routing path so that a single route handles all formats.
+
+Retrieve the format string in a handler:
+
+```go
+format, _ := r.Context().Value(middleware.URLFormatCtxKey).(string)
+```
+
+**Example**
+
+```go
+r.Use(middleware.URLFormat)
+
+r.Get("/articles/{id}", func(w http.ResponseWriter, r *http.Request) {
+    format, _ := r.Context().Value(middleware.URLFormatCtxKey).(string)
+    switch format {
+    case "json":
+        render.JSON(w, r, article)
+    case "xml":
+        render.XML(w, r, article)
+    default:
+        render.JSON(w, r, article)
+    }
+})
+// Matches: /articles/1  /articles/1.json  /articles/1.xml
+```
+
+</Accordion>
+
+<Accordion title="GetHead">
+
+```go
+func GetHead(next http.Handler) http.Handler
+```
+
+Automatically routes `HEAD` requests to the corresponding `GET` handler when no explicit `HEAD` handler is registered. The response body is discarded by the HTTP stack as per the HTTP specification, but response headers (including `Content-Length`) are computed by the GET handler.
+
+**Example**
+
+```go
+r.Use(middleware.GetHead)
+r.Get("/resource", resourceHandler)
+// HEAD /resource now works without a separate r.Head(...)
+```
+
+</Accordion>
+
+---
+
+## Security & Headers
+
+<Accordion title="BasicAuth">
+
+```go
+func BasicAuth(realm string, creds map[string]string) func(next http.Handler) http.Handler
+```
+
+Protects routes with HTTP Basic Authentication. Credentials are checked with `crypto/subtle.ConstantTimeCompare` to avoid timing attacks. Returns `WWW-Authenticate` and `HTTP 401` on failure.
+
+<ParamField path="realm" type="string" required>
+  The authentication realm displayed in the browser's credential prompt.
+</ParamField>
+<ParamField path="creds" type="map[string]string" required>
+  A map of `username → password` pairs. All values are stored in plaintext in memory, so keep the map small and use this middleware only for low-stakes protection or internal tooling.
+</ParamField>
+
+**Example**
+
+```go
+r.Use(middleware.BasicAuth("Admin Area", map[string]string{
+    "admin": "supersecret",
+    "ops":   "another-secret",
+}))
+```
+
+</Accordion>
+
+<Accordion title="NoCache">
+
+```go
+func NoCache(h http.Handler) http.Handler
+```
+
+Sets response headers that instruct proxies and browsers never to cache the response. Also removes any ETag-related request headers to prevent conditional-GET short-circuits. Suitable for dynamic API routes, dashboards, and admin endpoints.
+
+Headers set:
+
+| Header | Value |
+|---|---|
+| `Expires` | `Thu, 01 Jan 1970 00:00:00 UTC` |
+| `Cache-Control` | `no-cache, no-store, no-transform, must-revalidate, private, max-age=0` |
+| `Pragma` | `no-cache` |
+| `X-Accel-Expires` | `0` |
+
+**Example**
+
+```go
+r.Use(middleware.NoCache)
+r.Get("/api/live-feed", liveFeedHandler)
+```
+
+</Accordion>
+
+<Accordion title="WithValue">
+
+```go
+func WithValue(key, val interface{}) func(next http.Handler) http.Handler
+```
+
+Injects an arbitrary key/value pair into the request context. Useful for passing configuration, tenant information, or feature flags through a middleware stack without coupling the router to handler packages.
+
+<ParamField path="key" type="interface{}" required>
+  Context key. Use an unexported package-level type (e.g. `type ctxKey int`) to avoid collisions.
+</ParamField>
+<ParamField path="val" type="interface{}" required>
+  Value to store in the context.
+</ParamField>
+
+**Example**
+
+```go
+type envKey int
+const envCtxKey envKey = 0
+
+r.Use(middleware.WithValue(envCtxKey, "production"))
+
+r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+    env := r.Context().Value(envCtxKey).(string)
+    fmt.Fprintln(w, "env:", env)
+})
+```
+
+</Accordion>
+
+<Accordion title="Sunset">
+
+```go
+func Sunset(sunsetAt time.Time, links ...string) func(http.Handler) http.Handler
+```
+
+Adds `Sunset` and `Deprecation` headers to responses, signaling to API consumers that the route or API version will be retired. Optionally appends one or more `Link` header values pointing to successor documentation (per [RFC 8594](https://www.rfc-editor.org/rfc/rfc8594.html)).
+
+<ParamField path="sunsetAt" type="time.Time" required>
+  The date and time when the endpoint will be retired. If the zero value is passed, no headers are added.
+</ParamField>
+<ParamField path="links" type="...string">
+  Optional `Link` header values, e.g. `"<https://api.example.com/v2>; rel=\"successor-version\""`.
+</ParamField>
+
+**Example**
+
+```go
+retireAt := time.Date(2025, 12, 31, 23, 59, 59, 0, time.UTC)
+r.Use(middleware.Sunset(
+    retireAt,
+    `<https://api.example.com/v2>; rel="successor-version"`,
+))
+```
+
+</Accordion>
+
+---
+
+## Client IP
+
+The `ClientIPFrom*` family of middleware provides secure, explicit mechanisms for determining the real client IP address. Each variant stores the resolved IP in the request context; read it with `GetClientIP` or `GetClientIPAddr`.
+
+<Note>
+`RealIP` is deprecated and vulnerable to IP spoofing. Use the `ClientIPFrom*` middleware instead.
+</Note>
+
+<Accordion title="ClientIPFromRemoteAddr">
+
+```go
+func ClientIPFromRemoteAddr(h http.Handler) http.Handler
+```
+
+Reads the client IP directly from the TCP `RemoteAddr` of the connection. This is the most trustworthy source when the server is exposed directly to the internet without any reverse proxy in front of it.
+
+IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are folded to plain IPv4 before storage.
+
+<Warning>
+Behind a reverse proxy, `RemoteAddr` will be the proxy's IP, not the actual client's IP. Use `ClientIPFromHeader` or `ClientIPFromXFF` in that case.
+</Warning>
+
+**Example**
+
+```go
+r.Use(middleware.ClientIPFromRemoteAddr)
+
+r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+    ip := middleware.GetClientIP(r.Context())
+    fmt.Fprintln(w, "your IP:", ip)
+})
+```
+
+</Accordion>
+
+<Accordion title="ClientIPFromHeader">
+
+```go
+func ClientIPFromHeader(trustedHeader string) func(http.Handler) http.Handler
+```
+
+Reads the client IP from a single-value header unconditionally overwritten by your trusted reverse proxy (e.g. `X-Real-IP` set by Nginx, `CF-Connecting-IP` set by Cloudflare). If the header carries multiple values, the **last** value is used — the one written by the hop closest to this server.
+
+<ParamField path="trustedHeader" type="string" required>
+  The header name, e.g. `"X-Real-IP"` or `"CF-Connecting-IP"`. The value is canonicalized before lookup.
+</ParamField>
+
+**Example**
+
+```go
+// Nginx with ngx_http_realip_module
+r.Use(middleware.ClientIPFromHeader("X-Real-IP"))
+
+// Cloudflare
+r.Use(middleware.ClientIPFromHeader("CF-Connecting-IP"))
+```
+
+</Accordion>
+
+<Accordion title="ClientIPFromXFF">
+
+```go
+func ClientIPFromXFF(trustedIPPrefixes ...string) func(http.Handler) http.Handler
+```
+
+Walks the `X-Forwarded-For` header chain from right to left, skipping IPs that fall within any of the provided trusted CIDR prefixes. The first non-trusted IP found is the client. If an unparseable entry is encountered mid-chain, the walk aborts and no IP is stored (fail-closed).
+
+<ParamField path="trustedIPPrefixes" type="...string">
+  CIDR prefixes of your trusted proxies. Panics at startup if any prefix is invalid. Pass no arguments to use the rightmost XFF entry (safe only when exactly one trusted hop sits in front of this server).
+</ParamField>
+
+**Example**
+
+```go
+r.Use(middleware.ClientIPFromXFF(
+    "10.0.0.0/8",        // internal load balancer
+    "13.32.0.0/15",      // CloudFront IPv4
+    "2600:9000::/28",    // CloudFront IPv6
+))
+```
+
+</Accordion>
+
+<Accordion title="ClientIPFromXFFTrustedProxies">
+
+```go
+func ClientIPFromXFFTrustedProxies(numTrustedProxies int) func(http.Handler) http.Handler
+```
+
+Selects the client IP from `X-Forwarded-For` by counting a fixed number of trusted proxy hops from the right. Returns the IP at position `len(xff) - numTrustedProxies`. Use when proxy IP ranges are dynamic (autoscaling, ephemeral containers) and enumerating CIDRs is impractical.
+
+<ParamField path="numTrustedProxies" type="int" required>
+  Number of trusted reverse proxies between this server and the internet. Must be `>= 1`. Panics at startup otherwise.
+</ParamField>
+
+<Warning>
+This approach is brittle to infrastructure changes. If you add or remove a proxy tier, the count silently becomes wrong. Prefer `ClientIPFromXFF` with explicit CIDRs when possible.
+</Warning>
+
+**Example**
+
+```go
+// Exactly one trusted load balancer in front of this service
+r.Use(middleware.ClientIPFromXFFTrustedProxies(1))
+```
+
+</Accordion>
+
+<Accordion title="GetClientIP / GetClientIPAddr">
+
+```go
+func GetClientIP(ctx context.Context) string
+func GetClientIPAddr(ctx context.Context) netip.Addr
+```
+
+Read helpers for the IP stored by any `ClientIPFrom*` middleware.
+
+- `GetClientIP` returns the IP as a formatted string, or `""` if none was set.
+- `GetClientIPAddr` returns a `netip.Addr` zero value when not set; check with `.IsValid()` before use.
+
+**Example**
+
+```go
+r.Use(middleware.ClientIPFromHeader("X-Real-IP"))
+
+r.Get("/rate-limit-info", func(w http.ResponseWriter, r *http.Request) {
+    // String form — for logging, rate-limit keys
+    ipStr := middleware.GetClientIP(r.Context())
+
+    // Typed form — for prefix matching, Is4/Is6 checks
+    ipAddr := middleware.GetClientIPAddr(r.Context())
+    if ipAddr.IsValid() && ipAddr.Is6() {
+        fmt.Fprintln(w, "IPv6 client:", ipAddr)
+    }
+})
+```
+
+</Accordion>
+
+<Accordion title="RealIP (Deprecated)">
+
+```go
+func RealIP(h http.Handler) http.Handler
+```
+
+Sets `r.RemoteAddr` to the value of `True-Client-IP`, `X-Real-IP`, or the leftmost entry of `X-Forwarded-For` (checked in that order).
+
+<Warning>
+**Deprecated.** `RealIP` is vulnerable to IP spoofing (CVEs: GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp, GHSA-9g5q-2w5x-hmxf) because it trusts client-supplied headers without verification. Migrate to `ClientIPFromHeader`, `ClientIPFromXFF`, `ClientIPFromXFFTrustedProxies`, or `ClientIPFromRemoteAddr` and read the IP with `GetClientIP`.
+</Warning>
+
+</Accordion>
+
+---
+
+## Utilities
+
+<Accordion title="New">
+
+```go
+func New(h http.Handler) func(next http.Handler) http.Handler
+```
+
+Wraps a plain `http.Handler` as a middleware. The wrapped handler executes before `next` in the chain. Useful for adapting existing `http.Handler` values (e.g. from third-party packages) for use with `r.Use(...)`.
+
+<ParamField path="h" type="http.Handler" required>
+  The handler to execute as a middleware. Its response is written before `next` is called; `next` is not called at all if `h` writes a response and returns.
+</ParamField>
+
+**Example**
+
+```go
+corsHandler := cors.New(cors.Options{AllowedOrigins: []string{"*"}})
+r.Use(middleware.New(corsHandler))
+```
+
+</Accordion>
+
+<Accordion title="WrapResponseWriter / NewWrapResponseWriter">
+
+```go
+func NewWrapResponseWriter(w http.ResponseWriter, protoMajor int) WrapResponseWriter
+```
+
+Wraps an `http.ResponseWriter` with a proxy that captures the response status code and bytes written, and optionally tees the response body to a secondary writer. Automatically upgrades to implement `http.Flusher`, `http.Hijacker`, `io.ReaderFrom`, or `http.Pusher` when the underlying writer supports them.
+
+<ParamField path="w" type="http.ResponseWriter" required>
+  The response writer to wrap.
+</ParamField>
+<ParamField path="protoMajor" type="int" required>
+  The HTTP major protocol version from `r.ProtoMajor` (`1` for HTTP/1.x, `2` for HTTP/2).
+</ParamField>
+
+**`WrapResponseWriter` interface**
+
+```go
+type WrapResponseWriter interface {
+    http.ResponseWriter
+    Status() int                 // HTTP status code sent, or 0 if not yet written
+    BytesWritten() int           // Total bytes written to the client
+    Tee(io.Writer)               // Mirror response body to an additional writer
+    Unwrap() http.ResponseWriter // Access the original ResponseWriter
+    Discard()                    // Discard writes to the original writer (tee only)
+}
+```
+
+**Example — logging status and size in custom middleware**
+
+```go
+func myLoggingMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+        start := time.Now()
+
+        next.ServeHTTP(ww, r)
+
+        log.Printf("%s %s → %d (%d B) in %s",
+            r.Method, r.URL.Path,
+            ww.Status(), ww.BytesWritten(),
+            time.Since(start),
+        )
+    })
+}
+```
+
+</Accordion>
+
+---
+
+## Additional Helpers
+
+<CardGroup cols={2}>
+  <Card title="RouteHeaders" icon="route">
+    A header-based middleware router. Chain `.Route(header, match, middleware)` calls to dispatch requests to different middleware stacks based on header values. Supports wildcard matching (`*`).
+
+    ```go
+    r.Use(middleware.RouteHeaders().
+        Route("Host", "api.example.com", apiMiddleware).
+        Route("Host", "*.example.com", subdomainMiddleware).
+        Handler)
+    ```
+  </Card>
+  <Card title="StripPrefix" icon="scissors">
+    Wraps `http.StripPrefix` as a chi-compatible middleware factory. Strips the given path prefix before passing the request to the next handler.
+
+    ```go
+    r.Use(middleware.StripPrefix("/api/v1"))
+    ```
+  </Card>
+</CardGroup>

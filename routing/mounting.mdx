@@ -1,0 +1,223 @@
+---
+title: "Mounting http.Handler Sub-Routers in chi with r.Mount"
+sidebarTitle: "Mounting"
+description: "Attach any http.Handler or chi sub-router at a path prefix with r.Mount, enabling modular API composition and third-party handler integration."
+---
+
+`r.Mount(pattern, handler)` is chi's mechanism for attaching any value that implements `http.Handler` — including another `chi.Router`, a standard library `http.ServeMux`, or a third-party framework adapter — at a given path prefix. When a request's path begins with that prefix, chi strips the prefix from the routing context and forwards the request to the mounted handler, which then routes against its own internal pattern set as if it were the root. This makes it straightforward to split a large application into independent, separately testable routers and compose them into a single service.
+
+## Basic usage
+
+```go mount-basic.go
+package main
+
+import (
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+)
+
+func main() {
+	r := chi.NewRouter()
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("root."))
+	})
+
+	// Mount the admin sub-router at /admin
+	r.Mount("/admin", adminRouter())
+
+	http.ListenAndServe(":3333", r)
+}
+```
+
+## The adminRouter example
+
+A mounted handler is typically defined as a standalone function that builds and returns a fully configured router. This keeps the admin routes and their middleware entirely self-contained.
+
+```go admin-router.go
+// adminRouter returns a completely separate router for administrator routes.
+// It has its own middleware stack and route definitions.
+func adminRouter() chi.Router {
+	r := chi.NewRouter()
+	r.Use(AdminOnly) // protect every admin route
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("admin: index"))
+	})
+	r.Get("/accounts", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("admin: list accounts.."))
+	})
+	r.Get("/users/{userId}", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(fmt.Sprintf("admin: view user id %v", chi.URLParam(r, "userId"))))
+	})
+	return r
+}
+
+// AdminOnly middleware restricts access to just administrators.
+func AdminOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		isAdmin, ok := r.Context().Value("acl.admin").(bool)
+		if !ok || !isAdmin {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+With this setup, a `GET /admin/accounts` request matches `r.Mount("/admin", adminRouter())` on the root router, chi strips `/admin`, and the `adminRouter` sees a request for `/accounts`.
+
+## Prefix stripping
+
+When chi dispatches a request to a mounted handler, it updates `RouteContext.RoutePath` to the path with the mount prefix removed. The mounted handler routes purely against the remainder, so its patterns do not need to know where they are mounted.
+
+<Steps>
+  <Step title="Root router matches the prefix">
+    chi sees `GET /admin/users/42` and finds the `Mount("/admin", ...)` registration.
+  </Step>
+  <Step title="Prefix is stripped from the routing path">
+    The internal `RoutePath` is updated to `/users/42` before the mounted handler is called.
+  </Step>
+  <Step title="Mounted handler routes normally">
+    `adminRouter` matches the request against its own `r.Get("/users/{userId}", ...)` pattern,
+    as if the request had originally arrived at `/users/42`.
+  </Step>
+</Steps>
+
+## Mounting resource structs
+
+The resource-struct pattern pairs naturally with `Mount`. Each resource defines a `Routes()` method returning a `chi.Router`; `main` composes them with `Mount`.
+
+```go resource-mount.go
+package main
+
+import (
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+)
+
+func main() {
+	r := chi.NewRouter()
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("."))
+	})
+
+	r.Mount("/users", usersResource{}.Routes())
+	r.Mount("/todos", todosResource{}.Routes())
+
+	http.ListenAndServe(":3333", r)
+}
+```
+
+Each `Routes()` method builds its own isolated router:
+
+```go todos-routes.go
+type todosResource struct{}
+
+func (rs todosResource) Routes() chi.Router {
+	r := chi.NewRouter()
+
+	r.Get("/", rs.List)    // GET /todos
+	r.Post("/", rs.Create) // POST /todos
+
+	r.Route("/{id}", func(r chi.Router) {
+		r.Get("/", rs.Get)       // GET /todos/{id}
+		r.Put("/", rs.Update)    // PUT /todos/{id}
+		r.Delete("/", rs.Delete) // DELETE /todos/{id}
+		r.Get("/sync", rs.Sync)  // GET /todos/{id}/sync
+	})
+
+	return r
+}
+```
+
+## Mounting any http.Handler
+
+Because `r.Mount` accepts any `http.Handler`, you can attach standard library handlers, adapter wrappers, or third-party routers at a prefix.
+
+```go mount-std-handler.go
+r := chi.NewRouter()
+
+// Serve static files from ./public under /static/*
+r.Mount("/static", http.StripPrefix("/static", http.FileServer(http.Dir("public"))))
+
+// Attach net/http/pprof under /debug
+r.Mount("/debug", middleware.Profiler())
+```
+
+<Warning>
+  You cannot register two `Mount` calls with the same pattern. chi detects the conflict at
+  startup and panics with: `chi: attempting to Mount() a handler on an existing path`.
+  Ensure each mount point is unique.
+</Warning>
+
+## Mount vs Route
+
+<Tabs>
+  <Tab title="r.Mount">
+    Accepts **any** `http.Handler` — chi routers, standard handlers, third-party adapters.
+    The mounted handler is a completely independent unit with its own middleware stack.
+    The prefix is stripped before the request reaches the handler.
+
+    ```go mount.go
+    // adminRouter() returns a fully configured chi.Router
+    r.Mount("/admin", adminRouter())
+
+    // Works with any http.Handler
+    r.Mount("/static", http.FileServer(http.Dir("public")))
+    ```
+  </Tab>
+  <Tab title="r.Route">
+    Creates a **new chi sub-router inline** and mounts it at the pattern in one step.
+    Shorthand for `chi.NewRouter()` + `r.Mount`. Can only hold chi-registered routes.
+
+    ```go route.go
+    // Equivalent to building a chi.NewRouter, registering routes,
+    // and calling r.Mount("/admin", subRouter)
+    r.Route("/admin", func(r chi.Router) {
+      r.Use(AdminOnly)
+      r.Get("/", adminIndex)
+      r.Get("/accounts", adminListAccounts)
+    })
+    ```
+  </Tab>
+</Tabs>
+
+## Custom 404 and 405 propagation
+
+When you mount a `*chi.Mux` that has no custom `NotFound` or `MethodNotAllowed` handler of its own, chi automatically inherits those handlers from the parent router.
+
+```go handler-propagation.go
+r := chi.NewRouter()
+
+// Defined on the root — propagates to all mounted chi sub-routers
+r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotFound)
+	w.Write([]byte(`{"error": "not found"}`))
+})
+
+r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	w.Write([]byte(`{"error": "method not allowed"}`))
+})
+
+r.Mount("/admin", adminRouter()) // adminRouter inherits the handlers above
+```
+
+<Tip>
+  Define `NotFound` and `MethodNotAllowed` on the root router before calling `Mount`, so every
+  mounted sub-router that does not set its own handler automatically uses the root-level response.
+</Tip>

@@ -1,0 +1,219 @@
+---
+title: "URL Parameters in chi: Named, Regex, and Wildcards"
+sidebarTitle: "URL Parameters"
+description: "Extract named params, regex-constrained captures, and wildcard segments from chi routes using URLParam and URLParamFromCtx on the request context."
+---
+
+When chi matches an incoming request against the routing tree, it captures every placeholder in the matched pattern and stores the key–value pairs on the request's `context.Context`. You can read those values anywhere in the handler chain — inside middleware, sub-routers, or final handlers — without any additional parsing. chi provides two helper functions for this: `chi.URLParam(r, key)` takes the `*http.Request` directly, while `chi.URLParamFromCtx(ctx, key)` works when you only have a `context.Context`.
+
+## Named parameters
+
+A named placeholder is written as `{name}` inside a route pattern. It matches any sequence of characters up to the next `/` or the end of the URL, and the matched value is stored under the given name.
+
+```go named-params.go
+package main
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+)
+
+func main() {
+	r := chi.NewRouter()
+
+	// Pattern: /users/{userID}
+	r.Get("/users/{userID}", func(w http.ResponseWriter, r *http.Request) {
+		// Fetch the url parameter "userID" from the request context
+		userID := chi.URLParam(r, "userID")
+		w.Write([]byte(fmt.Sprintf("user: %s", userID)))
+	})
+
+	http.ListenAndServe(":3000", r)
+}
+```
+
+<Note>
+  Named params do **not** match `/` characters. The pattern `/users/{userID}` will match
+  `/users/42` but not `/users/42/profile`. Use a wildcard or a longer pattern for that.
+</Note>
+
+## Reading params via context
+
+`chi.URLParamFromCtx` is useful inside middleware that receives a `context.Context` rather than a full `*http.Request`.
+
+```go url-param-from-ctx.go
+import (
+	"context"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+)
+
+// HTTP handler accessing the url routing parameters.
+func MyRequestHandler(w http.ResponseWriter, r *http.Request) {
+	// Read named param directly from the request
+	userID := chi.URLParam(r, "userID")
+
+	// Or read from a context.Context you already have
+	ctx := r.Context()
+	key := chi.URLParamFromCtx(ctx, "userID")
+
+	w.Write([]byte(fmt.Sprintf("hi %v, %v", userID, key)))
+}
+```
+
+## Multiple params in one segment
+
+You can place several named placeholders inside a single path segment, separated by literal characters. chi parses each one independently.
+
+```go multi-params.go
+r := chi.NewRouter()
+
+// Matches /articles/01-16-2017
+r.With(paginate).Get("/articles/{month}-{day}-{year}", listArticlesByDate)
+```
+
+Inside `listArticlesByDate` you retrieve each part individually:
+
+```go list-articles-by-date.go
+func listArticlesByDate(w http.ResponseWriter, r *http.Request) {
+	month := chi.URLParam(r, "month")
+	day   := chi.URLParam(r, "day")
+	year  := chi.URLParam(r, "year")
+
+	w.Write([]byte(fmt.Sprintf("date: %s-%s-%s", year, month, day)))
+}
+```
+
+## Regex-constrained parameters
+
+Add a colon and a Go RE2 regular expression after the param name to restrict what chi will match. Requests that do not satisfy the expression fall through to the next matching route.
+
+```go regex-params.go
+r := chi.NewRouter()
+
+// Only matches slugs composed of lowercase letters and hyphens
+r.Get("/articles/{articleSlug:[a-z-]+}", getArticleBySlug)
+
+// Only matches purely numeric IDs
+r.Get("/users/{id:\\d+}", getUser)
+
+// Four-digit year, two-digit month and day
+r.Get("/date/{yyyy:\\d{4}}/{mm:\\d{2}}/{dd:\\d{2}}", getByDate)
+```
+
+<Tip>
+  The `/` character is never matched by a regexp placeholder. You don't need to exclude it from
+  your pattern — chi handles that automatically.
+</Tip>
+
+### Anonymous regex
+
+If you need a regex constraint but don't want to capture the value under a name, use an empty name before the colon. The segment is still matched against the expression, but nothing is stored in the URL params.
+
+```go anonymous-regex.go
+// Matches /v1/42/data but "42" is not stored in URLParams
+r.Get("/v1/{:\\d+}/data", handleVersionedData)
+```
+
+## Real-world example: ArticleCtx middleware
+
+The pattern below comes directly from the chi REST example. The `ArticleCtx` middleware reads both a numeric ID param and a slug param from the URL, looks up the article, and places it on the context so the downstream handler can use it without repeating the database call.
+
+```go article-ctx.go
+// ArticleCtx middleware loads an *Article from URL parameters and
+// places it on the request context for downstream handlers.
+func ArticleCtx(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var article *Article
+		var err error
+
+		if articleID := chi.URLParam(r, "articleID"); articleID != "" {
+			article, err = dbGetArticle(articleID)
+		} else if articleSlug := chi.URLParam(r, "articleSlug"); articleSlug != "" {
+			article, err = dbGetArticleBySlug(articleSlug)
+		} else {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), "article", article)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+```
+
+The routes that use this middleware:
+
+```go article-routes.go
+r.Route("/{articleID}", func(r chi.Router) {
+	r.Use(ArticleCtx)            // load *Article onto context
+	r.Get("/", getArticle)       // GET /articles/123
+	r.Put("/", updateArticle)    // PUT /articles/123
+	r.Delete("/", deleteArticle) // DELETE /articles/123
+})
+
+// Slug-based route also uses ArticleCtx via r.With
+r.With(ArticleCtx).Get("/{articleSlug:[a-z-]+}", getArticle)
+```
+
+## Wildcard parameter
+
+The special `*` placeholder matches the remainder of the path, including any `/` characters. Retrieve the captured value with the key `"*"`.
+
+```go wildcard-param.go
+r := chi.NewRouter()
+
+// Matches /files/docs/2024/report.pdf — captures "docs/2024/report.pdf"
+r.Get("/files/*", func(w http.ResponseWriter, r *http.Request) {
+	filePath := chi.URLParam(r, "*")
+	w.Write([]byte(fmt.Sprintf("serving: %s", filePath)))
+})
+```
+
+<Warning>
+  Only one wildcard `*` is allowed per route pattern, and it must appear at the end.
+  Any trailing characters after `*` in the pattern are ignored.
+</Warning>
+
+## Quick reference
+
+<CodeGroup>
+
+```go Named parameter
+// Pattern
+r.Get("/users/{userID}", handler)
+
+// Handler
+userID := chi.URLParam(r, "userID")
+```
+
+```go Regex parameter
+// Pattern
+r.Get("/articles/{articleSlug:[a-z-]+}", handler)
+
+// Handler
+slug := chi.URLParam(r, "articleSlug")
+```
+
+```go Wildcard
+// Pattern
+r.Get("/files/*", handler)
+
+// Handler
+rest := chi.URLParam(r, "*")
+```
+
+```go From context
+// When you have a context.Context
+id := chi.URLParamFromCtx(ctx, "userID")
+```
+
+</CodeGroup>

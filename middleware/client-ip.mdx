@@ -1,0 +1,238 @@
+---
+title: "Client IP Extraction in chi: Safe Proxy-Aware Middleware"
+sidebarTitle: "Client IP"
+description: "Safely resolve real client IP addresses in chi using ClientIPFrom* middlewares. Understand proxy trust, XFF chains, and why RealIP is deprecated."
+---
+
+Determining the real client IP address in a Go HTTP service is deceptively tricky. When your server sits behind one or more reverse proxies, load balancers, or CDN edge nodes, the TCP-level `r.RemoteAddr` is the IP of the last proxy — not the browser or mobile app making the request. The industry standard workaround — trusting `X-Forwarded-For` — introduces IP spoofing vulnerabilities unless handled carefully.
+
+Chi ships four `ClientIPFrom*` middlewares that replace the deprecated `RealIP` handler. Each targets a specific network topology and stores a canonical `netip.Addr` in the request context rather than mutating `r.RemoteAddr`.
+
+## Why `RealIP` is deprecated
+
+The legacy `RealIP` middleware (still present but marked deprecated) reads the leftmost `X-Forwarded-For` value, or falls back to `True-Client-IP` / `X-Real-IP`, and writes the result to `r.RemoteAddr`. This approach is vulnerable to IP spoofing:
+
+- An attacker can add a fake `X-Forwarded-For` header to any request.
+- If your proxy appends rather than overwrites, the "leftmost" IP is entirely attacker-controlled.
+- `True-Client-IP` and similar headers are passed through by default in some CDN products, making them trivially forgeable unless your edge strips them.
+
+These issues are documented in security advisories **GHSA-3fxj-6jh8-hvhx**, **GHSA-rjr7-jggh-pgcp**, and **GHSA-9g5q-2w5x-hmxf**. The four `ClientIPFrom*` middlewares address the threat model directly.
+
+<Warning>
+  Do not use `middleware.RealIP` in new code. Choose the appropriate `ClientIPFrom*` middleware for your network topology instead.
+</Warning>
+
+---
+
+## Choosing the right middleware
+
+| Deployment setup | Middleware to use |
+|---|---|
+| Directly on the public internet, no proxy | `middleware.ClientIPFromRemoteAddr` |
+| Behind nginx (`X-Real-IP`), Cloudflare (`CF-Connecting-IP`), Apache (`X-Client-IP`) | `middleware.ClientIPFromHeader("<your-trusted-header>")` |
+| Behind one or more proxies whose IP ranges you can list as CIDRs | `middleware.ClientIPFromXFF("10.0.0.0/8", ...)` |
+| Behind a known, fixed number of proxies with dynamic IPs | `middleware.ClientIPFromXFFTrustedProxies(2)` |
+
+Pick **exactly one** of the four and register it as middleware on your router. All four store the resolved IP in the same context key, so `GetClientIP` and `GetClientIPAddr` work identically regardless of which middleware you chose.
+
+---
+
+## `ClientIPFromRemoteAddr`
+
+Use this when your server has a direct TCP connection to the public internet with no proxy between it and the client. The middleware reads `r.RemoteAddr`, strips the port, and stores the parsed `netip.Addr` in context.
+
+```go signature
+func ClientIPFromRemoteAddr(h http.Handler) http.Handler
+```
+
+```go remote_addr_usage.go
+r := chi.NewRouter()
+r.Use(middleware.RequestID)
+r.Use(middleware.ClientIPFromRemoteAddr)
+r.Use(middleware.Logger)
+r.Use(middleware.Recoverer)
+```
+
+IPv4 clients on a dual-stack listener surface as `::ffff:a.b.c.d`; the middleware folds them to plain IPv4 before storage so one logical client maps to one canonical key for logs and rate limits.
+
+---
+
+## `ClientIPFromHeader`
+
+Use this when a single trusted reverse proxy sits in front of your server and unconditionally **overwrites** a known header with the real client IP. Examples of headers that are safe to use (assuming the proxy strips inbound values):
+
+- `X-Real-IP` — nginx with `ngx_http_realip_module`
+- `CF-Connecting-IP` — Cloudflare
+- `X-Client-IP` — Apache with `mod_remoteip`
+
+```go signature
+func ClientIPFromHeader(trustedHeader string) func(http.Handler) http.Handler
+```
+
+```go header_usage.go
+// Behind Cloudflare:
+r.Use(middleware.ClientIPFromHeader("CF-Connecting-IP"))
+
+// Behind nginx with X-Real-IP:
+r.Use(middleware.ClientIPFromHeader("X-Real-IP"))
+```
+
+If the header arrives with multiple values (a misconfigured proxy that appends rather than replaces), the **last** value wins — that is the one set by the hop closest to this server and therefore the most trustworthy. If the last value does not parse as a valid IP, no client IP is stored (fail-closed).
+
+<Warning>
+  Headers like `True-Client-IP`, `X-Azure-ClientIP`, and `Fastly-Client-IP` look similar but may be passed through from the client by default in those products. Only use `ClientIPFromHeader` with a header your edge **unconditionally overwrites** on every inbound request.
+</Warning>
+
+---
+
+## `ClientIPFromXFF`
+
+Use this when your service sits behind one or more reverse proxies and you can enumerate their IP address ranges as CIDR prefixes. The middleware walks the merged `X-Forwarded-For` chain right-to-left, skipping every IP that falls within a trusted prefix. The first untrusted IP it encounters is the client.
+
+```go signature
+func ClientIPFromXFF(trustedIPPrefixes ...string) func(http.Handler) http.Handler
+```
+
+```go xff_usage.go
+// Behind AWS CloudFront — list the CloudFront IP ranges as trusted CIDRs:
+r.Use(middleware.ClientIPFromXFF(
+    "13.32.0.0/15",   // CloudFront IPv4
+    "52.46.0.0/18",   // CloudFront IPv4
+    "2600:9000::/28", // CloudFront IPv6
+))
+```
+
+An unparseable entry mid-chain aborts the walk and leaves no client IP set (fail-closed) — the middleware cannot safely trust anything to the left of garbage. Calling `ClientIPFromXFF` with no arguments returns the rightmost XFF entry without any trust-list filtering, which is safe only if you have exactly one trusted hop directly in front of the server.
+
+The middleware panics at startup if any CIDR prefix string is invalid, catching misconfiguration at boot rather than silently at runtime.
+
+---
+
+## `ClientIPFromXFFTrustedProxies`
+
+Use this when you know the exact number of trusted reverse proxies in your chain but cannot enumerate their IP ranges — for example, an autoscaling CDN edge with dynamic IPs.
+
+```go signature
+func ClientIPFromXFFTrustedProxies(numTrustedProxies int) func(http.Handler) http.Handler
+```
+
+```go xff_trusted_proxies_usage.go
+// There are exactly 2 proxies between the client and this server.
+r.Use(middleware.ClientIPFromXFFTrustedProxies(2))
+```
+
+The middleware selects the entry at position `len(xff) - numTrustedProxies` in the merged XFF list. If the chain is shorter than `numTrustedProxies`, no client IP is set. The middleware panics at startup if `numTrustedProxies < 1`.
+
+<Warning>
+  `ClientIPFromXFFTrustedProxies` is brittle to architecture changes. Adding or removing a proxy layer silently makes `numTrustedProxies` wrong and may cause the server to trust an attacker-supplied IP. Prefer `ClientIPFromXFF` with explicit CIDRs whenever your infrastructure allows it.
+</Warning>
+
+---
+
+## Reading the client IP in handlers
+
+Both retrieval functions read from the same context key set by any of the four middlewares above.
+
+```go signature
+func GetClientIP(ctx context.Context) string
+func GetClientIPAddr(ctx context.Context) netip.Addr
+```
+
+```go get_client_ip.go
+r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+    // String form — convenient for logging, rate-limit keys, ACL checks:
+    clientIP := middleware.GetClientIP(r.Context())
+
+    // netip.Addr form — convenient for typed work (prefix containment, Is4/Is6):
+    clientAddr := middleware.GetClientIPAddr(r.Context())
+    _ = clientAddr.Is4()
+
+    w.Write([]byte("your IP: " + clientIP))
+})
+```
+
+`GetClientIP` returns an empty string if no middleware has set the value. `GetClientIPAddr` returns the zero `netip.Addr`; call `.IsValid()` to check.
+
+---
+
+## Normalization guarantees
+
+All four middlewares apply the same normalization before storage:
+
+- **IPv4-mapped IPv6** (`::ffff:a.b.c.d`) is folded to plain IPv4, so one logical client maps to exactly one canonical address for logs, rate limits, and ACLs.
+- **IPv6 zone identifiers** (e.g., `%eth0`) carried in header values are stripped, defending against prefix-check bypass via aliasing. `ClientIPFromRemoteAddr` preserves zones for legitimate link-local connections.
+
+---
+
+## Complete Cloudflare and CloudFront examples
+
+<CodeGroup>
+
+```go cloudflare.go
+package main
+
+import (
+    "net/http"
+
+    "github.com/go-chi/chi/v5"
+    "github.com/go-chi/chi/v5/middleware"
+)
+
+func main() {
+    r := chi.NewRouter()
+    r.Use(middleware.RequestID)
+
+    // Cloudflare always overwrites CF-Connecting-IP with the visitor's IP.
+    r.Use(middleware.ClientIPFromHeader("CF-Connecting-IP"))
+
+    r.Use(middleware.Logger)
+    r.Use(middleware.Recoverer)
+
+    r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+        ip := middleware.GetClientIP(r.Context())
+        w.Write([]byte("hello " + ip))
+    })
+
+    http.ListenAndServe(":3000", r)
+}
+```
+
+```go cloudfront.go
+package main
+
+import (
+    "net/http"
+
+    "github.com/go-chi/chi/v5"
+    "github.com/go-chi/chi/v5/middleware"
+)
+
+func main() {
+    r := chi.NewRouter()
+    r.Use(middleware.RequestID)
+
+    // CloudFront adds the client IP to X-Forwarded-For before forwarding.
+    // List CloudFront's published IP ranges as trusted CIDRs.
+    r.Use(middleware.ClientIPFromXFF(
+        "13.32.0.0/15",
+        "52.46.0.0/18",
+        "2600:9000::/28",
+    ))
+
+    r.Use(middleware.Logger)
+    r.Use(middleware.Recoverer)
+
+    r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+        ip := middleware.GetClientIP(r.Context())
+        w.Write([]byte("hello " + ip))
+    })
+
+    http.ListenAndServe(":3000", r)
+}
+```
+
+</CodeGroup>
+
+<Tip>
+  For a thorough treatment of the threat model and the pitfalls of every approach to client-IP resolution, see [adam-p's "The perils of the 'real' client IP"](https://adam-p.ca/blog/2022/03/x-forwarded-for/).
+</Tip>

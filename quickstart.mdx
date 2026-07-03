@@ -1,47 +1,218 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Quickstart: Run Your First Go HTTP Service with chi"
+sidebarTitle: "Quickstart"
+description: "Build and run a chi HTTP service in minutes. Covers go module setup, hello-world server, Logger and Recoverer middleware stack, and URL parameter route handling."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you through creating a working HTTP service with chi from scratch. By the end you will have a server running on `localhost:3333` that handles requests with structured middleware and dynamic URL parameters. The only prerequisite is a working Go 1.23+ installation and a Go module (`go mod init`) for your project.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+## Steps
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Install chi">
+    Add chi to your Go module. Run the following command inside your project directory:
 
     ```bash
-    npm install your-package
+    go get github.com/go-chi/chi/v5
+    ```
+
+    This fetches chi v5 and records it in your `go.mod` file. chi has **zero external dependencies**, so nothing else will be pulled in beyond chi itself.
+
+    <Note>
+      Make sure you have initialized a Go module first. If you haven't, run `go mod init your/module/name` before the `go get` command.
+    </Note>
+  </Step>
+
+  <Step title="Write a hello-world server">
+    Create `main.go` in your project directory with the following content. This is the canonical hello-world example drawn directly from chi's own `_examples/hello-world/` directory:
+
+    ```go main.go
+    package main
+
+    import (
+    	"net/http"
+
+    	"github.com/go-chi/chi/v5"
+    	"github.com/go-chi/chi/v5/middleware"
+    )
+
+    func main() {
+    	r := chi.NewRouter()
+    	r.Use(middleware.RequestID)
+    	r.Use(middleware.Logger)
+    	r.Use(middleware.Recoverer)
+
+    	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+    		w.Write([]byte("hello world"))
+    	})
+
+    	http.ListenAndServe(":3333", r)
+    }
+    ```
+
+    Three built-in middlewares are applied to every request:
+    - **RequestID** — injects a unique request ID into the context and response headers.
+    - **Logger** — logs the start and end of each request with the elapsed processing time.
+    - **Recoverer** — catches any panics in downstream handlers, prints the stack trace, and returns a `500` response instead of crashing the server.
+  </Step>
+
+  <Step title="Run the server">
+    Start the server with:
+
+    ```bash
+    go run main.go
+    ```
+
+    You should see the Logger middleware print a line for each incoming request. In a separate terminal, test the endpoint:
+
+    ```bash
+    curl http://localhost:3333/
+    ```
+
+    Expected response:
+
+    ```
+    hello world
+    ```
+
+    The Logger middleware will output something similar to:
+
+    ```
+    2024/02/16 12:00:00 "GET http://localhost:3333/ HTTP/1.1" from 127.0.0.1 - 200 11B in 42.5µs
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
-    ```bash
-    your-cli init
+  <Step title="Add a URL parameter route">
+    Extend your server to handle a dynamic URL segment. chi uses `{paramName}` syntax in route patterns and provides `chi.URLParam` to read the value at runtime.
+
+    <CodeGroup>
+    ```go main.go
+    package main
+
+    import (
+    	"fmt"
+    	"net/http"
+
+    	"github.com/go-chi/chi/v5"
+    	"github.com/go-chi/chi/v5/middleware"
+    )
+
+    func main() {
+    	r := chi.NewRouter()
+    	r.Use(middleware.RequestID)
+    	r.Use(middleware.Logger)
+    	r.Use(middleware.Recoverer)
+
+    	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+    		w.Write([]byte("hello world"))
+    	})
+
+    	// Named URL parameter: {name}
+    	r.Get("/hello/{name}", func(w http.ResponseWriter, r *http.Request) {
+    		name := chi.URLParam(r, "name")
+    		w.Write([]byte(fmt.Sprintf("hello, %s!", name)))
+    	})
+
+    	http.ListenAndServe(":3333", r)
+    }
     ```
+
+    ```bash curl examples
+    # Root route
+    curl http://localhost:3333/
+    # hello world
+
+    # Named parameter route
+    curl http://localhost:3333/hello/gopher
+    # hello, gopher!
+    ```
+    </CodeGroup>
+
+    `chi.URLParam(r, "name")` reads the `{name}` segment from the URL. The value is stored on the request's `context.Context` by chi's router — no global state is involved.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
 
-    ```bash
-    your-cli start
+  <Step title="Explore a richer example">
+    For a more complete picture, here is a server with route groups, a middleware stack, and a `Timeout`. This pattern mirrors real-world chi services:
+
+    ```go main.go
+    package main
+
+    import (
+    	"net/http"
+    	"time"
+
+    	"github.com/go-chi/chi/v5"
+    	"github.com/go-chi/chi/v5/middleware"
+    )
+
+    func main() {
+    	r := chi.NewRouter()
+
+    	// Base middleware stack applied to all routes
+    	r.Use(middleware.RequestID)
+    	r.Use(middleware.Logger)
+    	r.Use(middleware.Recoverer)
+    	r.Use(middleware.Timeout(60 * time.Second))
+
+    	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+    		w.Write([]byte("hi"))
+    	})
+
+    	// Route group for /articles with its own middleware
+    	r.Route("/articles", func(r chi.Router) {
+    		r.Get("/", listArticles)       // GET /articles
+    		r.Post("/", createArticle)     // POST /articles
+    		r.Get("/search", searchArticles) // GET /articles/search
+
+    		// Nested route with middleware applied inline
+    		r.Route("/{articleID}", func(r chi.Router) {
+    			r.Use(articleCtx)
+    			r.Get("/", getArticle)     // GET /articles/123
+    			r.Put("/", updateArticle)  // PUT /articles/123
+    			r.Delete("/", deleteArticle) // DELETE /articles/123
+    		})
+    	})
+
+    	http.ListenAndServe(":3333", r)
+    }
+
+    func listArticles(w http.ResponseWriter, r *http.Request)   { w.Write([]byte("list")) }
+    func createArticle(w http.ResponseWriter, r *http.Request)  { w.Write([]byte("create")) }
+    func searchArticles(w http.ResponseWriter, r *http.Request) { w.Write([]byte("search")) }
+    func getArticle(w http.ResponseWriter, r *http.Request)     { w.Write([]byte("get")) }
+    func updateArticle(w http.ResponseWriter, r *http.Request)  { w.Write([]byte("update")) }
+    func deleteArticle(w http.ResponseWriter, r *http.Request)  { w.Write([]byte("delete")) }
+
+    func articleCtx(next http.Handler) http.Handler {
+    	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    		articleID := chi.URLParam(r, "articleID")
+    		// load article from DB, attach to context, etc.
+    		_ = articleID
+    		next.ServeHTTP(w, r)
+    	})
+    }
     ```
+
+    Key patterns demonstrated here:
+    - `r.Route(...)` creates an inline sub-router at a path prefix with its own middleware stack.
+    - Middleware added inside `r.Route(...)` only runs for requests matching that group.
+    - `middleware.Timeout` signals through `ctx.Done()` when the deadline is exceeded, allowing handlers to abort cleanly.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## What's next?
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Routing Overview" icon="map" href="/routing/overview">
+    Deep dive into URL patterns, wildcards, regexp params, and sub-router mounting.
+  </Card>
+  <Card title="Middleware Overview" icon="layer-group" href="/middleware/overview">
+    Browse chi's full built-in middleware suite and learn how to write your own.
+  </Card>
+  <Card title="REST API Guide" icon="code" href="/guides/rest-api">
+    Build a complete CRUD REST API with chi, including context-based resource loading.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Go module setup, version requirements, and upgrading from chi v4.
+  </Card>
+</CardGroup>

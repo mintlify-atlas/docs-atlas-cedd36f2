@@ -1,0 +1,402 @@
+---
+title: "Testing chi Handlers and Routers in Go"
+sidebarTitle: "Testing"
+description: "Test chi HTTP handlers and routers using Go's httptest package — unit tests, router integration tests, URL param injection, and middleware behavior verification."
+---
+
+chi is built entirely on the standard `net/http` interface, which means you can test every handler, middleware, and router using only Go's built-in `net/http/httptest` package — no special testing framework needed. This guide walks through the core patterns chi itself uses internally and that you should use in your own services.
+
+## The two testing shapes
+
+There are two common shapes for testing chi applications:
+
+<CardGroup cols={2}>
+  <Card title="Unit testing a handler" icon="function">
+    Create a bare `*http.Request` and an `httptest.ResponseRecorder`, call
+    `handler.ServeHTTP(w, r)` directly. Fast and isolated.
+  </Card>
+  <Card title="Integration testing a router" icon="network-wired">
+    Start a real `httptest.Server` backed by a fully configured chi router and
+    make actual HTTP requests. Tests the full middleware + routing stack.
+  </Card>
+</CardGroup>
+
+## Unit testing a single handler
+
+Use `httptest.NewRecorder()` and `http.NewRequest()` to invoke a handler function without starting a server. This is ideal for handlers that do not depend on URL parameters.
+
+```go handler_test.go
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func helloHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("hello world"))
+}
+
+func TestHelloHandler(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	helloHandler(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+	if w.Body.String() != "hello world" {
+		t.Errorf("unexpected body: %s", w.Body.String())
+	}
+}
+```
+
+## Testing URL parameter routes
+
+URL parameters are stored in chi's routing context, which is normally populated by the chi router during a real request. When testing a handler in isolation (without a router), you need to inject the routing context manually.
+
+The pattern chi itself uses in `mux_test.go`:
+
+```go url_param_test.go
+package main
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+)
+
+func greetHandler(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	w.Write([]byte("hi " + name))
+}
+
+func TestGreetHandler_WithURLParam(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+
+	// Build a chi routing context and inject the URL parameter manually.
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("name", "joe")
+
+	// Attach the routing context to the request context.
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	w := httptest.NewRecorder()
+	greetHandler(w, req)
+
+	if w.Body.String() != "hi joe" {
+		t.Fatalf("expected 'hi joe', got '%s'", w.Body.String())
+	}
+}
+```
+
+<Note>
+  `chi.NewRouteContext()` returns a fresh `*chi.Context`. After adding params
+  with `rctx.URLParams.Add(key, value)`, store it on the request context using
+  the exported `chi.RouteCtxKey` as the key.
+</Note>
+
+## Integration testing a full router
+
+For end-to-end tests that exercise middleware, route matching, and handler behaviour together, start an `httptest.Server` backed by the fully configured chi router. This mirrors the approach used throughout chi's own `mux_test.go`.
+
+```go router_test.go
+package main
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+)
+
+func newTestRouter() chi.Router {
+	r := chi.NewRouter()
+	r.Use(middleware.Recoverer)
+
+	r.Get("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("pong"))
+	})
+	r.Get("/articles/{articleID}", func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "articleID")
+		w.Write([]byte("article:" + id))
+	})
+
+	return r
+}
+
+func TestRouter_Ping(t *testing.T) {
+	ts := httptest.NewServer(newTestRouter())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/ping")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "pong" {
+		t.Errorf("expected 'pong', got '%s'", body)
+	}
+}
+
+func TestRouter_ArticleByID(t *testing.T) {
+	ts := httptest.NewServer(newTestRouter())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/articles/42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "article:42" {
+		t.Errorf("expected 'article:42', got '%s'", body)
+	}
+}
+```
+
+## Testing with httptest.NewRecorder directly on the router
+
+You can also call `router.ServeHTTP(w, r)` directly on a chi router without starting a TCP server. This is slightly faster than `httptest.NewServer` and works well when you do not need a real URL:
+
+```go recorder_router_test.go
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+)
+
+func TestRouter_WithRecorder(t *testing.T) {
+	r := chi.NewRouter()
+	r.Get("/hi", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("bye"))
+	})
+	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("nothing here"))
+	})
+
+	tests := []struct {
+		path   string
+		want   string
+		status int
+	}{
+		{"/hi", "bye", http.StatusOK},
+		{"/nothing-here", "nothing here", http.StatusNotFound},
+	}
+
+	for _, tc := range tests {
+		req, _ := http.NewRequest(http.MethodGet, tc.path, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != tc.status {
+			t.Errorf("path %s: expected status %d, got %d", tc.path, tc.status, w.Code)
+		}
+		if w.Body.String() != tc.want {
+			t.Errorf("path %s: expected body '%s', got '%s'", tc.path, tc.want, w.Body.String())
+		}
+	}
+}
+```
+
+## Testing middleware behaviour
+
+Test middleware by wiring it to a minimal router or by calling it directly around a stub handler. The example below tests that a custom authentication middleware returns 401 when no token is present and calls the next handler when a token is provided.
+
+```go middleware_test.go
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+)
+
+// TokenAuth is a simple middleware that checks for a Bearer token.
+func TokenAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("Authorization")
+		if token != "Bearer secret" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func TestTokenAuth_Missing(t *testing.T) {
+	r := chi.NewRouter()
+	r.With(TokenAuth).Get("/protected", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	req, _ := http.NewRequest(http.MethodGet, "/protected", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestTokenAuth_Valid(t *testing.T) {
+	r := chi.NewRouter()
+	r.With(TokenAuth).Get("/protected", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	req, _ := http.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	if w.Body.String() != "ok" {
+		t.Errorf("expected 'ok', got '%s'", w.Body.String())
+	}
+}
+```
+
+## Testing with an existing context
+
+Sometimes a middleware sets values on a parent context before the request reaches the router (e.g., from a framework that pre-populates context). You can pass that context into the test request with `r.WithContext`:
+
+```go existing_context_test.go
+package main
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+)
+
+type ctxKey struct{ name string }
+
+func TestHandler_ExistingContext(t *testing.T) {
+	r := chi.NewRouter()
+	r.Get("/hi", func(w http.ResponseWriter, r *http.Request) {
+		val, _ := r.Context().Value(ctxKey{"msg"}).(string)
+		w.Write([]byte(val))
+	})
+
+	req, _ := http.NewRequest(http.MethodGet, "/hi", nil)
+	req = req.WithContext(
+		context.WithValue(req.Context(), ctxKey{"msg"}, "hello from context"),
+	)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Body.String() != "hello from context" {
+		t.Errorf("unexpected body: %s", w.Body.String())
+	}
+}
+```
+
+## End-to-end tests with httptest.NewServer
+
+`httptest.NewServer` starts a real HTTP server on a random localhost port and returns a `*httptest.Server` with a `.URL` field. Use it when you need to test with real HTTP semantics — cookies, redirects, connection pooling — or when invoking code that builds an absolute URL.
+
+```go e2e_test.go
+package main
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+)
+
+func TestServer_EndToEnd(t *testing.T) {
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(middleware.Recoverer)
+
+	r.Get("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("unexpected Content-Type: %s", ct)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != `{"status":"ok"}` {
+		t.Errorf("unexpected body: %s", body)
+	}
+}
+```
+
+<Tip>
+  Always call `defer ts.Close()` immediately after `httptest.NewServer(...)` to
+  ensure the test server is shut down even if the test panics or fails early.
+</Tip>
+
+## Quick reference
+
+<Accordion title="Which approach should I use?">
+  | Scenario                                      | Recommended approach                          |
+  |-----------------------------------------------|-----------------------------------------------|
+  | Testing a single handler with no URL params   | `httptest.NewRecorder` + direct call          |
+  | Testing a handler that reads URL params       | `chi.NewRouteContext` + param injection        |
+  | Testing middleware in isolation               | `r.With(mw).Get(...)` + `NewRecorder`         |
+  | Testing the full middleware + routing stack   | `r.ServeHTTP(w, req)` with `NewRecorder`      |
+  | End-to-end tests with real HTTP semantics     | `httptest.NewServer` + `http.DefaultClient`   |
+</Accordion>
+
+<Accordion title="How do I test a 404 handler?">
+  Register a custom `r.NotFound(...)` handler on your router, then make a
+  request to a path that does not match any registered route. Assert that
+  `w.Code` equals `http.StatusNotFound` and check the body.
+</Accordion>
+
+<Accordion title="Can I test method-not-allowed responses?">
+  Yes. Register a route for `GET /hi` only, then make a `POST /hi` request.
+  chi will call the `MethodNotAllowed` handler (default or custom) and return
+  `405`. You can also register `r.MethodNotAllowed(...)` to customise the
+  response.
+</Accordion>

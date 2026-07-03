@@ -1,0 +1,146 @@
+---
+title: "Install chi v5: Go Module Setup and v4 to v5 Migration"
+sidebarTitle: "Installation"
+description: "Install chi v5 with go get, understand the go.mod require entry, confirm zero external dependencies, and migrate import paths cleanly from chi v4 to v5."
+---
+
+chi is distributed as a standard Go module and requires no external dependencies beyond the Go standard library. Installation is a single `go get` command, and the module integrates cleanly into any existing Go project that uses Go modules (`go.mod`).
+
+## Requirements
+
+chi v5 targets the **four most recent major Go releases** and currently requires **Go 1.23 or later**. Check your installed version with:
+
+```bash
+go version
+```
+
+If you need an older Go version, chi v4 (`github.com/go-chi/chi`) supports earlier releases, but v5 is strongly recommended for all new projects.
+
+## Install
+
+Inside your Go module project directory, run:
+
+```bash
+go get github.com/go-chi/chi/v5
+```
+
+This downloads chi, adds it to your `go.mod`, and writes the resolved checksum to `go.sum`. After the command completes, your `go.mod` will contain:
+
+```go go.mod
+module your/module/name
+
+go 1.23
+
+require github.com/go-chi/chi/v5 v5.0.12
+```
+
+<Note>
+  If your project does not yet have a `go.mod` file, initialize one first with `go mod init your/module/name`, then run the `go get` command above.
+</Note>
+
+## Zero external dependencies
+
+chi pulls in **no third-party packages**. Every feature — the router, the middleware package, URL parameter parsing — is implemented using the Go standard library only. You can verify this after installation:
+
+```bash
+go mod graph
+```
+
+The output will list only `github.com/go-chi/chi/v5` with no transitive dependencies. This keeps your build reproducible and your `go.sum` minimal.
+
+<Tip>
+  Because chi has no external dependencies, you can also vendor it with `go mod vendor` and the resulting `vendor/` directory will contain only chi's own source files.
+</Tip>
+
+## Import path
+
+Once installed, import chi and its middleware sub-package in your Go source files:
+
+```go main.go
+import (
+    "github.com/go-chi/chi/v5"
+    "github.com/go-chi/chi/v5/middleware"
+)
+```
+
+## Upgrading from v4 to v5
+
+chi v5 introduced [Go module Semantic Import Versioning (SIV)](https://go.dev/ref/mod#major-version-suffixes). The **only breaking change** between v4 and v5 is the import path — the entire public API is identical.
+
+<Tabs>
+  <Tab title="Before (v4)">
+    ```go
+    import (
+        "github.com/go-chi/chi"
+        "github.com/go-chi/chi/middleware"
+    )
+    ```
+  </Tab>
+  <Tab title="After (v5)">
+    ```go
+    import (
+        "github.com/go-chi/chi/v5"
+        "github.com/go-chi/chi/v5/middleware"
+    )
+    ```
+  </Tab>
+</Tabs>
+
+To migrate an existing project:
+
+<Steps>
+  <Step title="Get chi v5">
+    ```bash
+    go get github.com/go-chi/chi/v5
+    ```
+  </Step>
+  <Step title="Update all import paths">
+    Use your editor's find-and-replace, or run the following command to update all Go files at once:
+
+    ```bash
+    find . -name "*.go" -exec sed -i \
+      's|github.com/go-chi/chi"|github.com/go-chi/chi/v5"|g;
+       s|github.com/go-chi/chi/middleware|github.com/go-chi/chi/v5/middleware|g' {} +
+    ```
+  </Step>
+  <Step title="Remove the old v4 dependency">
+    ```bash
+    go mod tidy
+    ```
+
+    `go mod tidy` will drop the `github.com/go-chi/chi` (v4) entry from `go.mod` and `go.sum` once no import paths reference it anymore.
+  </Step>
+  <Step title="Verify the build">
+    ```bash
+    go build ./...
+    ```
+
+    If the build succeeds with no errors, the migration is complete. No functional changes to your handlers, middleware, or routing logic are required.
+  </Step>
+</Steps>
+
+<Warning>
+  Do not import both `github.com/go-chi/chi` (v4) and `github.com/go-chi/chi/v5` in the same binary — the types are distinct and handlers from one version cannot be passed to a router from the other. Run `go mod tidy` after updating all import paths to ensure only the v5 module remains.
+</Warning>
+
+## Optional ecosystem packages
+
+After installing the core router, you can add any of chi's first-party companion packages the same way — each is an independent module with its own versioning:
+
+```bash
+# CORS middleware
+go get github.com/go-chi/cors
+
+# JWT authentication
+go get github.com/go-chi/jwtauth/v5
+
+# Structured HTTP logging
+go get github.com/go-chi/httplog/v2
+
+# Rate limiting
+go get github.com/go-chi/httprate
+```
+
+<Info>
+  The full list of official chi ecosystem packages is maintained at [https://github.com/go-chi](https://github.com/go-chi).
+</Info>

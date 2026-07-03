@@ -1,0 +1,188 @@
+---
+title: "chi Routing Overview: Trie-Based HTTP Router for Go"
+sidebarTitle: "Overview"
+description: "Learn how chi routes HTTP requests using a Patricia Radix trie, with named params, regex constraints, wildcards, and custom 404/405 handlers."
+---
+
+chi routes HTTP requests using a [Patricia Radix trie](https://en.wikipedia.org/wiki/Radix_tree) — a compact prefix tree that delivers fast, allocation-efficient lookups even across thousands of routes. Every route you register is stored as a node in this tree, and at request time chi walks the tree once to find the best match, extract URL parameters, and invoke the correct handler. Because chi implements the standard `http.Handler` interface throughout, every middleware package, test helper, and deployment tool that works with `net/http` works identically with chi.
+
+## The Router interface
+
+chi's `Router` interface extends `http.Handler` with methods for registering routes, composing middleware, and building sub-routers. You get a concrete `*Mux` by calling `chi.NewRouter()`.
+
+```go main.go
+package main
+
+import (
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+)
+
+func main() {
+	r := chi.NewRouter()
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("welcome"))
+	})
+
+	http.ListenAndServe(":3000", r)
+}
+```
+
+## HTTP method routing
+
+chi provides a dedicated method for every standard HTTP verb. Each method accepts a URL pattern and an `http.HandlerFunc`.
+
+```go routes.go
+r := chi.NewRouter()
+
+r.Get("/articles", listArticles)        // GET
+r.Post("/articles", createArticle)      // POST
+r.Put("/articles/{id}", updateArticle)  // PUT
+r.Patch("/articles/{id}", patchArticle) // PATCH
+r.Delete("/articles/{id}", deleteArticle) // DELETE
+
+r.Head("/articles", headArticles)       // HEAD
+r.Options("/articles", optionsArticles) // OPTIONS
+r.Connect("/tunnel", tunnelHandler)     // CONNECT
+r.Trace("/trace", traceHandler)         // TRACE
+```
+
+### Dynamic method selection
+
+When you need to select a method at runtime or register a handler that responds to every HTTP method, use `Handle`, `HandleFunc`, `Method`, or `MethodFunc`.
+
+```go dynamic-methods.go
+// Handle and HandleFunc match ALL HTTP methods
+r.Handle("/assets/*", http.FileServer(http.Dir("static")))
+r.HandleFunc("/health", healthCheck)
+
+// Method and MethodFunc let you pass the verb as a string
+r.Method("GET", "/reports/{id}", reportHandler)
+r.MethodFunc("POST", "/events", eventHandlerFunc)
+```
+
+## URL pattern syntax
+
+All patterns must begin with `/`. chi supports four kinds of placeholders.
+
+| Syntax | Name | Example | Matches |
+|---|---|---|---|
+| `{name}` | Named param | `/users/{userID}` | Any sequence up to the next `/` |
+| `{name:regexp}` | Regex param | `/{articleSlug:[a-z-]+}` | Only characters matching the regexp |
+| `{:regexp}` | Anonymous regex | `/v1/{:\d+}/data` | Matches the regexp without capturing |
+| `*` | Wildcard | `/files/*` | Remainder of the path, including `/` |
+
+<Note>
+  Regular expressions use Go's RE2 syntax. The `/` character is **never** matched by a regexp
+  placeholder — use the `*` wildcard if you need to match across path segments.
+</Note>
+
+### Pattern examples
+
+```go pattern-examples.go
+// Named param — matches /user/jsmith but NOT /user/jsmith/info
+r.Get("/user/{name}", getUser)
+
+// Named param mid-path — matches /user/jsmith/info
+r.Get("/user/{name}/info", getUserInfo)
+
+// Multiple named params in one segment
+r.Get("/articles/{month}-{day}-{year}", listArticlesByDate)
+
+// Regex param — matches /articles/home-is-toronto
+r.Get("/articles/{articleSlug:[a-z-]+}", getArticleBySlug)
+
+// Date components with regex
+r.Get("/date/{yyyy:\\d{4}}/{mm:\\d{2}}/{dd:\\d{2}}", getByDate)
+
+// Wildcard — matches /page/intro/latest and /page/anything/else
+r.Get("/page/*", pageHandler)
+```
+
+## Full articles example
+
+The following example from the chi README shows named params, regex constraints, nested sub-routers, and middleware composition all working together.
+
+```go articles.go
+func main() {
+	r := chi.NewRouter()
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("hi"))
+	})
+
+	// RESTy routes for "articles" resource
+	r.Route("/articles", func(r chi.Router) {
+		r.With(paginate).Get("/", listArticles)                           // GET /articles
+		r.With(paginate).Get("/{month}-{day}-{year}", listArticlesByDate) // GET /articles/01-16-2017
+
+		r.Post("/", createArticle)                                        // POST /articles
+		r.Get("/search", searchArticles)                                  // GET /articles/search
+
+		// Regexp url parameter:
+		r.Get("/{articleSlug:[a-z-]+}", getArticleBySlug) // GET /articles/home-is-toronto
+
+		// Subrouter with middleware:
+		r.Route("/{articleID}", func(r chi.Router) {
+			r.Use(ArticleCtx)
+			r.Get("/", getArticle)    // GET /articles/123
+			r.Put("/", updateArticle) // PUT /articles/123
+			r.Delete("/", deleteArticle) // DELETE /articles/123
+		})
+	})
+
+	r.Mount("/admin", adminRouter())
+
+	http.ListenAndServe(":3333", r)
+}
+```
+
+## Custom 404 and 405 handlers
+
+chi lets you replace the default `http.NotFound` and `405 Method Not Allowed` responses with your own handlers. Custom handlers propagate down to all sub-routers that don't define their own.
+
+```go custom-handlers.go
+r := chi.NewRouter()
+
+r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotFound)
+	w.Write([]byte(`{"error": "route not found"}`))
+})
+
+r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	w.Write([]byte(`{"error": "method not allowed"}`))
+})
+```
+
+<Tip>
+  Define `NotFound` and `MethodNotAllowed` on the root router before registering any routes.
+  Chi propagates the handlers to all sub-routers that don't have their own custom handler set.
+</Tip>
+
+## Patricia Radix trie internals
+
+chi's trie compresses common path prefixes so that `/articles`, `/articles/search`, and `/articles/{id}` share a single `/articles` prefix node. This keeps memory usage low and lookup time proportional to the length of the path rather than the total number of routes. URL parameters are captured during the trie walk and stored directly on the request context via `context.WithValue`, making them available through `chi.URLParam(r, "key")` from any point downstream in the handler chain.
+
+<CardGroup cols={2}>
+  <Card title="URL Parameters" icon="brackets-curly" href="/routing/url-parameters">
+    Read named params, regex captures, and wildcards from the request context.
+  </Card>
+  <Card title="Sub-Routers" icon="sitemap" href="/routing/subrouters">
+    Compose routes with `r.Route`, `r.Group`, and `r.With`.
+  </Card>
+  <Card title="Mounting" icon="plug" href="/routing/mounting">
+    Attach any `http.Handler` at a path prefix with `r.Mount`.
+  </Card>
+</CardGroup>

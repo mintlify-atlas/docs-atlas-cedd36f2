@@ -1,0 +1,263 @@
+---
+title: "The go-chi Ecosystem: Packages and Integrations"
+sidebarTitle: "Ecosystem"
+description: "Explore the go-chi GitHub organization's official packages for CORS, JWT auth, rate limiting, logging, tracing, host routing, and more — all compatible with chi."
+---
+
+chi is deliberately small — the core router is under 1,000 lines of code with zero external dependencies. Functionality beyond routing is provided by a growing collection of first-party packages under the [go-chi GitHub organization](https://github.com/go-chi), each designed as a standard `net/http` middleware so it works with chi and any other compatible router.
+
+## Official packages
+
+<CardGroup cols={2}>
+  <Card
+    title="cors"
+    icon="globe"
+    href="https://github.com/go-chi/cors"
+  >
+    Cross-origin resource sharing (CORS) middleware. Handles preflight requests
+    and injects the appropriate `Access-Control-*` response headers.
+  </Card>
+  <Card
+    title="docgen"
+    icon="file-lines"
+    href="https://github.com/go-chi/docgen"
+  >
+    Introspects a `chi.Router` at runtime and generates routing documentation
+    in JSON or Markdown — no annotations required.
+  </Card>
+  <Card
+    title="jwtauth"
+    icon="key"
+    href="https://github.com/go-chi/jwtauth"
+  >
+    JWT authentication middleware. Verifies tokens on incoming requests and
+    places the parsed claims on the request context.
+  </Card>
+  <Card
+    title="hostrouter"
+    icon="server"
+    href="https://github.com/go-chi/hostrouter"
+  >
+    Domain and host-based request routing. Mount separate chi routers for
+    different hostnames or subdomains on a single listener.
+  </Card>
+  <Card
+    title="httplog"
+    icon="list"
+    href="https://github.com/go-chi/httplog"
+  >
+    Small but powerful structured HTTP request logging built on `slog` /
+    `zerolog`. Captures status codes, latency, and request metadata.
+  </Card>
+  <Card
+    title="httprate"
+    icon="gauge-high"
+    href="https://github.com/go-chi/httprate"
+  >
+    HTTP request rate limiter. Supports per-IP, per-user, and global limits
+    with configurable window sizes and custom key functions.
+  </Card>
+  <Card
+    title="httptracer"
+    icon="chart-line"
+    href="https://github.com/go-chi/httptracer"
+  >
+    HTTP request performance tracing library. Hooks into handler execution to
+    record timing and trace data for observability pipelines.
+  </Card>
+  <Card
+    title="httpvcr"
+    icon="video"
+    href="https://github.com/go-chi/httpvcr"
+  >
+    Record and replay HTTP interactions with external services. Write
+    deterministic tests for code that calls third-party APIs.
+  </Card>
+  <Card
+    title="stampede"
+    icon="layer-group"
+    href="https://github.com/go-chi/stampede"
+  >
+    HTTP request coalescer. Collapses concurrent identical requests into a
+    single upstream call and fans the response out to all waiting clients.
+  </Card>
+</CardGroup>
+
+## Using cors middleware
+
+The `cors` package is one of the most commonly used chi ecosystem packages. Install it and attach it to your router's middleware stack:
+
+```bash
+go get github.com/go-chi/cors
+```
+
+<Steps>
+
+### Import and configure
+
+```go main.go
+package main
+
+import (
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+)
+
+func main() {
+	r := chi.NewRouter()
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	// CORS middleware — must be registered before your route handlers.
+	r.Use(cors.Handler(cors.Options{
+		// AllowedOrigins accepts a list of allowed origins.
+		// Use "*" to allow all origins in development only.
+		AllowedOrigins: []string{"https://example.com", "https://app.example.com"},
+
+		// AllowedMethods lists the HTTP methods your API supports.
+		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+
+		// AllowedHeaders lists the headers a client can include in a request.
+		AllowedHeaders: []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
+
+		// ExposedHeaders lists response headers the browser is allowed to access.
+		ExposedHeaders: []string{"Link"},
+
+		// AllowCredentials permits cookies/auth headers to be sent cross-origin.
+		AllowCredentials: true,
+
+		// MaxAge caches the preflight response for the given number of seconds.
+		MaxAge: 300,
+	}))
+
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("hello"))
+	})
+
+	http.ListenAndServe(":3333", r)
+}
+```
+
+### Verify with a preflight request
+
+```bash
+curl -i -X OPTIONS http://localhost:3333/ \
+  -H "Origin: https://example.com" \
+  -H "Access-Control-Request-Method: POST"
+```
+
+A successful preflight returns `204 No Content` with the `Access-Control-Allow-*` headers set by the `cors` middleware.
+
+</Steps>
+
+<Warning>
+  Do not use `AllowedOrigins: []string{"*"}` in production when
+  `AllowCredentials: true` is set. Browsers block credentialed requests to
+  wildcard origins; use explicit origin lists instead.
+</Warning>
+
+## Generating route documentation with docgen
+
+`docgen` traverses a fully configured `chi.Router` and prints every registered route:
+
+```go docgen_example.go
+package main
+
+import (
+	"fmt"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/docgen"
+)
+
+func printRoutes(r chi.Router) {
+	// Print routes as Markdown.
+	fmt.Println(docgen.MarkdownRoutesDoc(r, docgen.MarkdownOpts{
+		ProjectPath: "github.com/your-org/your-service",
+		Intro:       "API route reference.",
+	}))
+
+	// Or as JSON for machine consumption.
+	// fmt.Println(docgen.JSONRoutesDoc(r))
+}
+```
+
+<Tip>
+  Pass a `-routes` flag to your binary and call `printRoutes` conditionally.
+  This lets CI pipelines generate up-to-date API docs on every build without
+  starting the HTTP server.
+</Tip>
+
+## Beyond REST
+
+chi is a general-purpose HTTP router — not a REST-only framework. Many teams use it as the foundation layer for other communication protocols.
+
+<Tabs>
+  <Tab title="webrpc">
+    [webrpc](https://github.com/webrpc/webrpc) is a web-focused RPC framework with code generation for clients and servers. It generates a standard `http.Handler` that you can mount directly onto a chi router:
+
+    ```go webrpc_mount.go
+    // Mount a generated webrpc handler at /rpc
+    r.Mount("/rpc", generated.NewMyServiceServer(myServiceImpl, nil))
+    ```
+  </Tab>
+  <Tab title="gRPC (grpc-gateway)">
+    [grpc-gateway](https://github.com/grpc-ecosystem/grpc-gateway) generates a reverse-proxy that translates REST/JSON calls into gRPC. Mount the generated handler on chi to add gRPC support alongside your existing REST routes:
+
+    ```go grpc_gateway.go
+    gwMux := runtime.NewServeMux()
+    pb.RegisterMyServiceHandlerFromEndpoint(ctx, gwMux, grpcAddr, opts)
+
+    // Mount the gRPC-gateway alongside REST routes.
+    r.Mount("/api/v1", gwMux)
+    ```
+  </Tab>
+  <Tab title="GraphQL">
+    [gqlgen](https://github.com/99designs/gqlgen) generates a type-safe GraphQL server. The generated handler is a plain `http.Handler`:
+
+    ```go graphql_mount.go
+    srv := handler.NewDefaultServer(
+        generated.NewExecutableSchema(generated.Config{Resolvers: &resolver{}}),
+    )
+
+    r.Handle("/graphql", srv)
+    r.Handle("/playground", playground.Handler("GraphQL", "/graphql"))
+    ```
+  </Tab>
+  <Tab title="NATS">
+    [NATS](https://nats.io) is a lightweight pub-sub messaging system. Use chi to expose an HTTP API while NATS handles internal service-to-service events:
+
+    ```go nats_plus_chi.go
+    nc, _ := nats.Connect(nats.DefaultURL)
+
+    r.Post("/events", func(w http.ResponseWriter, r *http.Request) {
+        var payload []byte
+        // read payload from r.Body ...
+        nc.Publish("events.incoming", payload)
+        w.WriteHeader(http.StatusAccepted)
+    })
+    ```
+  </Tab>
+</Tabs>
+
+## Community middleware
+
+Beyond the official `go-chi` organization, the broader `net/http` ecosystem is fully compatible with chi. Any middleware that accepts and returns an `http.Handler` works without any adapter or shim. Popular community options include:
+
+| Package | Purpose |
+|---|---|
+| [`gorilla/sessions`](https://github.com/gorilla/sessions) | Cookie and filesystem session store |
+| [`unrolled/secure`](https://github.com/unrolled/secure) | HTTP security headers (CSP, HSTS, etc.) |
+| [`felixge/httpsnoop`](https://github.com/felixge/httpsnoop) | Capture `http.ResponseWriter` metrics without wrapping |
+| [`rs/zerolog`](https://github.com/rs/zerolog) | Zero-allocation structured JSON logging |
+
+<Note>
+  If a middleware claims to work with `net/http`, it works with chi. There are
+  no adapters, no special interfaces, and no registration steps beyond
+  `r.Use(myMiddleware)`.
+</Note>

@@ -1,0 +1,320 @@
+---
+title: "Writing Custom Middleware for chi: Patterns and Examples"
+sidebarTitle: "Custom Middleware"
+description: "Learn to write custom chi middleware: context values, auth guards, response writer wrapping, per-route middleware with r.With(), and the New() helper."
+---
+
+Because chi uses pure `net/http` handlers, writing custom middleware requires no framework-specific types or adapters. A middleware is simply a function that accepts an `http.Handler` and returns a new `http.Handler` that wraps it. You can inspect and modify the request before passing control downstream, and inspect or modify the response after it returns.
+
+## The middleware signature
+
+```go signature.go
+// Every chi middleware has exactly this type.
+func MyMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Pre-processing: runs before downstream handlers
+        next.ServeHTTP(w, r)
+        // Post-processing: runs after downstream handlers complete
+    })
+}
+```
+
+The key mechanics:
+
+- Wrap the logic in `http.HandlerFunc(func(...) {...})` to satisfy the `http.Handler` interface.
+- Call `next.ServeHTTP(w, r)` to pass control to the next handler in the chain.
+- Pass `r.WithContext(ctx)` to propagate a modified context to downstream handlers.
+- Skip calling `next.ServeHTTP` entirely to short-circuit the chain (e.g., for auth failures).
+
+---
+
+## Pattern 1: Setting a context value
+
+This is the most common middleware pattern — compute or validate some data for each request and make it available to every downstream handler via the request context.
+
+```go context_value.go
+package main
+
+import (
+    "context"
+    "fmt"
+    "net/http"
+
+    "github.com/go-chi/chi/v5"
+)
+
+// Define an unexported context key type to prevent collisions across packages.
+type contextKey string
+
+const userContextKey contextKey = "user"
+
+// UserMiddleware loads user information and stores it on the request context.
+// Replace the stub lookup with a real session/JWT/DB call.
+func UserMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Hypothetical lookup — in practice, read a token from the request.
+        userID := "123"
+
+        ctx := context.WithValue(r.Context(), userContextKey, userID)
+
+        // r.WithContext creates a shallow copy of the request with the new context.
+        // Previously set context values remain accessible downstream.
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+
+func profileHandler(w http.ResponseWriter, r *http.Request) {
+    userID, _ := r.Context().Value(userContextKey).(string)
+    w.Write([]byte(fmt.Sprintf("profile for user %s", userID)))
+}
+
+func main() {
+    r := chi.NewRouter()
+    r.Use(UserMiddleware)
+    r.Get("/profile", profileHandler)
+    http.ListenAndServe(":3000", r)
+}
+```
+
+---
+
+## Pattern 2: Short-circuiting the chain (auth guard)
+
+A middleware can write a response and return **without** calling `next.ServeHTTP`. This short-circuits the rest of the chain, which is the correct approach for access control checks.
+
+```go auth_guard.go
+package main
+
+import (
+    "net/http"
+
+    "github.com/go-chi/chi/v5"
+)
+
+// AdminOnly allows the request through only when the caller has admin
+// permissions stored on the context (set by an earlier auth middleware).
+func AdminOnly(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        ctx := r.Context()
+
+        // In a real application, read a typed permission value from ctx.
+        isAdmin, _ := ctx.Value("is_admin").(bool)
+        if !isAdmin {
+            // Write the error response and return immediately.
+            // next.ServeHTTP is never called.
+            http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+            return
+        }
+
+        next.ServeHTTP(w, r)
+    })
+}
+
+func main() {
+    r := chi.NewRouter()
+    // Apply AdminOnly to every route in the /admin sub-tree
+    r.Route("/admin", func(r chi.Router) {
+        r.Use(AdminOnly)
+        r.Get("/", adminIndex)
+    })
+    http.ListenAndServe(":3000", r)
+}
+
+func adminIndex(w http.ResponseWriter, r *http.Request) {
+    w.Write([]byte("admin dashboard"))
+}
+```
+
+---
+
+## Pattern 3: Capturing the response status code
+
+By default, `http.ResponseWriter` does not expose the status code after it has been written. Wrap the writer to intercept `WriteHeader` calls and record the code for logging, metrics, or post-processing.
+
+```go wrap_response_writer.go
+package main
+
+import (
+    "fmt"
+    "net/http"
+
+    "github.com/go-chi/chi/v5"
+    "github.com/go-chi/chi/v5/middleware"
+)
+
+// StatusRecorderMiddleware logs the response status code after the handler runs.
+func StatusRecorderMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // NewWrapResponseWriter provides Status(), BytesWritten(), Tee(), and Unwrap().
+        // protoMajor tells it which optional interfaces (Pusher, Hijacker) to implement.
+        ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+
+        next.ServeHTTP(ww, r)
+
+        // After the handler returns, ww.Status() holds the written status code.
+        fmt.Printf("%s %s → %d (%d bytes)\n",
+            r.Method, r.URL.Path, ww.Status(), ww.BytesWritten())
+    })
+}
+
+func main() {
+    r := chi.NewRouter()
+    r.Use(StatusRecorderMiddleware)
+    r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusAccepted)
+        w.Write([]byte("accepted"))
+    })
+    http.ListenAndServe(":3000", r)
+}
+```
+
+`middleware.WrapResponseWriter` is the interface returned by `NewWrapResponseWriter`. It adds the following methods on top of `http.ResponseWriter`:
+
+| Method | Description |
+|---|---|
+| `Status() int` | HTTP status code sent to the client (0 if not yet written) |
+| `BytesWritten() int` | Total bytes written to the response body |
+| `Tee(io.Writer)` | Mirror response body writes to a second writer |
+| `Unwrap() http.ResponseWriter` | Return the underlying response writer |
+| `Discard()` | Discard writes to the original writer (keep only tee'd copy) |
+
+---
+
+## Pattern 4: Per-route middleware with `r.With()`
+
+`r.Use()` attaches middleware to an entire router. Use `r.With()` to scope middleware to a single route without creating a sub-router.
+
+```go per_route.go
+package main
+
+import (
+    "net/http"
+
+    "github.com/go-chi/chi/v5"
+)
+
+func requireJSON(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if r.Header.Get("Content-Type") != "application/json" {
+            http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+
+func main() {
+    r := chi.NewRouter()
+
+    r.Get("/health", healthHandler)          // no extra middleware
+    r.With(requireJSON).Post("/data", dataHandler) // requireJSON only here
+    http.ListenAndServe(":3000", r)
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) }
+func dataHandler(w http.ResponseWriter, r *http.Request)   { w.Write([]byte("got data")) }
+```
+
+Multiple middlewares can be chained in a single `r.With()` call:
+
+```go multi_with.go
+r.With(rateLimiter, requireJSON, validateToken).Post("/api/items", createItem)
+```
+
+---
+
+## The `middleware.New()` helper
+
+`middleware.New` converts any `http.Handler` — for example a pre-built handler from an external package — into a middleware function. The resulting middleware calls the provided handler for every request and then continues to the next handler in the chi chain.
+
+```go signature
+func New(h http.Handler) func(next http.Handler) http.Handler
+```
+
+```go new_helper.go
+package main
+
+import (
+    "net/http"
+
+    "github.com/go-chi/chi/v5"
+    "github.com/go-chi/chi/v5/middleware"
+)
+
+// externalHandler is some http.Handler from a third-party package.
+var externalHandler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    // sets a header, records a metric, etc.
+})
+
+func main() {
+    r := chi.NewRouter()
+
+    // Wrap externalHandler so it participates in the middleware chain.
+    r.Use(middleware.New(externalHandler))
+
+    r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("hello"))
+    })
+    http.ListenAndServe(":3000", r)
+}
+```
+
+---
+
+## Composing multiple patterns
+
+Real-world middleware often combines several of the patterns above. The example below implements a JWT authentication middleware that reads a token, validates it, populates the context with the parsed claims, and short-circuits with `401` on failure.
+
+```go jwt_style.go
+package main
+
+import (
+    "context"
+    "net/http"
+    "strings"
+)
+
+type Claims struct {
+    UserID string
+    Admin  bool
+}
+
+type claimsKey struct{}
+
+// AuthMiddleware validates a Bearer token and stores the parsed claims on ctx.
+func AuthMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        authHeader := r.Header.Get("Authorization")
+        if !strings.HasPrefix(authHeader, "Bearer ") {
+            http.Error(w, "missing or malformed token", http.StatusUnauthorized)
+            return
+        }
+
+        token := strings.TrimPrefix(authHeader, "Bearer ")
+
+        // Replace with real JWT validation logic.
+        claims, err := parseToken(token)
+        if err != nil {
+            http.Error(w, "invalid token", http.StatusUnauthorized)
+            return
+        }
+
+        ctx := context.WithValue(r.Context(), claimsKey{}, claims)
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+
+func parseToken(token string) (*Claims, error) {
+    // stub — replace with real validation
+    return &Claims{UserID: "42", Admin: false}, nil
+}
+
+func GetClaims(r *http.Request) *Claims {
+    claims, _ := r.Context().Value(claimsKey{}).(*Claims)
+    return claims
+}
+```
+
+<Tip>
+  Always define context keys as unexported struct types (e.g., `type claimsKey struct{}`), not as plain strings or integers. Struct-type keys are guaranteed unique across packages because package identity is part of the type, preventing accidental key collisions with other middleware.
+</Tip>

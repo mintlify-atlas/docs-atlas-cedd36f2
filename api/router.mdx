@@ -1,0 +1,465 @@
+---
+title: "chi Router Interface: Methods and Global Functions"
+sidebarTitle: "Router"
+description: "Complete reference for chi's Router interface — every routing method, HTTP verb shortcut, and global helper function with signatures and examples."
+---
+
+The `Router` interface is the core contract every chi router implements. It embeds both `http.Handler` and the `Routes` interface, meaning any `Router` value can be passed directly to `http.ListenAndServe` and also supports route introspection. The concrete implementation is [`Mux`](/api/mux), returned by `chi.NewRouter()`.
+
+---
+
+## Global Functions
+
+These package-level helpers are the main entry points for creating routers and reading URL parameters from within handlers.
+
+### `NewRouter`
+
+```go title="chi.go"
+func NewRouter() *Mux
+```
+
+Returns a new `*Mux` that implements `Router`. This is the recommended way to create a root router.
+
+```go title="main.go"
+package main
+
+import (
+    "net/http"
+    "github.com/go-chi/chi/v5"
+)
+
+func main() {
+    r := chi.NewRouter()
+    r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("hello"))
+    })
+    http.ListenAndServe(":3000", r)
+}
+```
+
+---
+
+### `URLParam`
+
+```go title="context.go"
+func URLParam(r *http.Request, key string) string
+```
+
+Returns the URL path parameter captured for `key` from the current request's routing context. Returns an empty string when the key is not present.
+
+<ParamField path="r" type="*http.Request" required>
+  The current HTTP request carrying a chi routing context.
+</ParamField>
+
+<ParamField path="key" type="string" required>
+  The named parameter key as defined in the route pattern, e.g. `"id"` for the pattern `/users/{id}`.
+</ParamField>
+
+<ResponseField name="" type="string">
+  The captured URL parameter value, or an empty string if not found.
+</ResponseField>
+
+```go title="handler.go"
+func getUser(w http.ResponseWriter, r *http.Request) {
+    userID := chi.URLParam(r, "id")
+    w.Write([]byte("User: " + userID))
+}
+```
+
+---
+
+### `URLParamFromCtx`
+
+```go title="context.go"
+func URLParamFromCtx(ctx context.Context, key string) string
+```
+
+Same as `URLParam` but accepts a `context.Context` directly instead of a full `*http.Request`. Useful when you have already extracted the context.
+
+<ParamField path="ctx" type="context.Context" required>
+  A context that contains a chi routing context value (set by the Mux on every request).
+</ParamField>
+
+<ParamField path="key" type="string" required>
+  The named parameter key to look up.
+</ParamField>
+
+<ResponseField name="" type="string">
+  The captured URL parameter value, or an empty string if not found.
+</ResponseField>
+
+---
+
+### `RouteContext`
+
+```go title="context.go"
+func RouteContext(ctx context.Context) *Context
+```
+
+Retrieves the chi `*Context` stored in a `context.Context`. The chi `Context` holds all routing state for the in-flight request, including URL params and matched route patterns.
+
+<ParamField path="ctx" type="context.Context" required>
+  The request context, typically obtained via `r.Context()`.
+</ParamField>
+
+<ResponseField name="" type="*Context">
+  The chi routing context, or `nil` if none is present.
+</ResponseField>
+
+```go title="middleware.go"
+func MyMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        next.ServeHTTP(w, r)
+        // Safe to call after next — RoutePattern is fully resolved
+        pattern := chi.RouteContext(r.Context()).RoutePattern()
+        log.Println("matched:", pattern)
+    })
+}
+```
+
+<Note>
+  Read `RoutePattern()` **after** calling `next.ServeHTTP` inside a middleware. The pattern is assembled incrementally as the request traverses sub-routers, so the value is only complete once routing finishes.
+</Note>
+
+---
+
+### `NewRouteContext`
+
+```go title="context.go"
+func NewRouteContext() *Context
+```
+
+Allocates and returns a fresh, empty `*Context`. Primarily useful for testing route matching with `Router.Match` or `Router.Find` without sending a real HTTP request.
+
+<ResponseField name="" type="*Context">
+  A newly allocated, zeroed chi routing context.
+</ResponseField>
+
+```go title="router_test.go"
+rctx := chi.NewRouteContext()
+matched := r.Match(rctx, "GET", "/users/42")
+```
+
+---
+
+## Router Interface
+
+```go title="chi.go"
+type Router interface {
+    http.Handler
+    Routes
+
+    Use(middlewares ...func(http.Handler) http.Handler)
+    With(middlewares ...func(http.Handler) http.Handler) Router
+    Group(fn func(r Router)) Router
+    Route(pattern string, fn func(r Router)) Router
+    Mount(pattern string, h http.Handler)
+    Handle(pattern string, h http.Handler)
+    HandleFunc(pattern string, h http.HandlerFunc)
+    Method(method, pattern string, h http.Handler)
+    MethodFunc(method, pattern string, h http.HandlerFunc)
+    Connect(pattern string, h http.HandlerFunc)
+    Delete(pattern string, h http.HandlerFunc)
+    Get(pattern string, h http.HandlerFunc)
+    Head(pattern string, h http.HandlerFunc)
+    Options(pattern string, h http.HandlerFunc)
+    Patch(pattern string, h http.HandlerFunc)
+    Post(pattern string, h http.HandlerFunc)
+    Put(pattern string, h http.HandlerFunc)
+    Trace(pattern string, h http.HandlerFunc)
+    NotFound(h http.HandlerFunc)
+    MethodNotAllowed(h http.HandlerFunc)
+}
+```
+
+---
+
+## Middleware Methods
+
+<Accordion title="Use — append middleware to the router stack">
+
+```go title="chi.go"
+Use(middlewares ...func(http.Handler) http.Handler)
+```
+
+Appends one or more middleware handlers to the router's middleware stack. The stack executes in the order middlewares are registered — before any route handler is invoked — giving each middleware the opportunity to short-circuit, modify the request, or set context values.
+
+<Warning>
+  All `Use()` calls must appear **before** any route registrations on the same `Mux`. Calling `Use()` after routes have been registered causes a panic.
+</Warning>
+
+<ParamField path="middlewares" type="...func(http.Handler) http.Handler" required>
+  One or more standard middleware functions. Each wraps the next handler in the chain.
+</ParamField>
+
+```go title="main.go"
+r := chi.NewRouter()
+r.Use(middleware.Logger)
+r.Use(middleware.Recoverer)
+r.Get("/", homeHandler)
+```
+
+</Accordion>
+
+<Accordion title="With — inline middleware for a single endpoint">
+
+```go title="chi.go"
+With(middlewares ...func(http.Handler) http.Handler) Router
+```
+
+Creates an inline sub-router that inherits the current middleware stack and appends the provided middlewares on top. Unlike `Use`, it can be called at any point and only affects the specific route(s) registered on the returned router.
+
+<ParamField path="middlewares" type="...func(http.Handler) http.Handler" required>
+  Middleware to apply only to routes registered on the returned inline router.
+</ParamField>
+
+<ResponseField name="" type="Router">
+  A new inline router with the combined middleware stack.
+</ResponseField>
+
+```go title="main.go"
+r.With(requireAuth).Get("/profile", profileHandler)
+```
+
+</Accordion>
+
+---
+
+## Grouping Methods
+
+<Accordion title="Group — inline sub-router on the same path">
+
+```go title="chi.go"
+Group(fn func(r Router)) Router
+```
+
+Creates a new inline sub-router at the **same** routing path as the parent, with a fresh copy of the middleware stack. Use it to apply a set of middlewares to several routes that share the same path prefix without introducing a new prefix.
+
+<ParamField path="fn" type="func(r Router)" required>
+  A callback that receives the new inline router and registers routes on it.
+</ParamField>
+
+<ResponseField name="" type="Router">
+  The newly created inline router.
+</ResponseField>
+
+```go title="routes.go"
+r.Group(func(r chi.Router) {
+    r.Use(requireAdmin)
+    r.Get("/admin/users", listUsersHandler)
+    r.Delete("/admin/users/{id}", deleteUserHandler)
+})
+```
+
+</Accordion>
+
+<Accordion title="Route — mount a sub-router at a path prefix">
+
+```go title="chi.go"
+Route(pattern string, fn func(r Router)) Router
+```
+
+Creates a new `*Mux` and mounts it at `pattern`. This is a shorthand for creating a router, registering routes in `fn`, and calling `Mount`. The sub-router gets its own independent middleware stack.
+
+<ParamField path="pattern" type="string" required>
+  The path prefix at which to mount the new sub-router. Must start with `/`.
+</ParamField>
+
+<ParamField path="fn" type="func(r Router)" required>
+  A callback that receives the new sub-router. Routes registered here are scoped under `pattern`.
+</ParamField>
+
+<ResponseField name="" type="Router">
+  The newly created sub-router.
+</ResponseField>
+
+```go title="routes.go"
+r.Route("/articles", func(r chi.Router) {
+    r.Get("/", listArticlesHandler)
+    r.Post("/", createArticleHandler)
+    r.Route("/{id}", func(r chi.Router) {
+        r.Get("/", getArticleHandler)
+        r.Put("/", updateArticleHandler)
+        r.Delete("/", deleteArticleHandler)
+    })
+})
+```
+
+</Accordion>
+
+<Accordion title="Mount — attach any http.Handler as a sub-router">
+
+```go title="chi.go"
+Mount(pattern string, h http.Handler)
+```
+
+Attaches any `http.Handler` — including another chi `Router` — under `pattern`. Mount sets a wildcard at `pattern/*` so the attached handler receives all requests whose path starts with `pattern`. The route path is adjusted to strip the matched prefix before delegating.
+
+<ParamField path="pattern" type="string" required>
+  The path prefix. Requests to `pattern`, `pattern/`, and `pattern/*` are all forwarded.
+</ParamField>
+
+<ParamField path="h" type="http.Handler" required>
+  The handler or sub-router to attach. Must not be `nil`.
+</ParamField>
+
+<Warning>
+  Mounting two handlers on the exact same pattern causes a panic at startup.
+</Warning>
+
+```go title="main.go"
+apiRouter := chi.NewRouter()
+apiRouter.Get("/users", listUsersHandler)
+
+r := chi.NewRouter()
+r.Mount("/api", apiRouter)
+// GET /api/users is now handled by apiRouter
+```
+
+</Accordion>
+
+---
+
+## Route Registration Methods
+
+<Accordion title="Handle and HandleFunc — match all HTTP methods">
+
+```go title="chi.go"
+Handle(pattern string, h http.Handler)
+HandleFunc(pattern string, h http.HandlerFunc)
+```
+
+Register a handler for `pattern` that matches **all** HTTP methods. `HandleFunc` is a convenience wrapper that accepts a `http.HandlerFunc` instead of a `http.Handler`.
+
+`Handle` also supports an optional method prefix separated by whitespace, e.g. `"GET /path"`, which makes it equivalent to `Method("GET", "/path", h)`.
+
+<ParamField path="pattern" type="string" required>
+  The URL pattern. Must begin with `/`.
+</ParamField>
+
+<ParamField path="h" type="http.Handler / http.HandlerFunc" required>
+  The handler to invoke when the pattern matches.
+</ParamField>
+
+```go title="routes.go"
+r.Handle("/assets/*", http.StripPrefix("/assets/", http.FileServer(http.Dir("static"))))
+r.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+    w.Write([]byte("pong"))
+})
+```
+
+</Accordion>
+
+<Accordion title="Method and MethodFunc — match a specific HTTP method">
+
+```go title="chi.go"
+Method(method, pattern string, h http.Handler)
+MethodFunc(method, pattern string, h http.HandlerFunc)
+```
+
+Register a handler for `pattern` that only matches the given `method` string. The method is case-insensitive and must be one of the standard HTTP methods. An unrecognised method causes a panic.
+
+<ParamField path="method" type="string" required>
+  The HTTP method string, e.g. `"GET"`, `"POST"`. Case-insensitive.
+</ParamField>
+
+<ParamField path="pattern" type="string" required>
+  The URL pattern. Must begin with `/`.
+</ParamField>
+
+<ParamField path="h" type="http.Handler / http.HandlerFunc" required>
+  The handler to invoke on a match.
+</ParamField>
+
+```go title="routes.go"
+r.Method("GET", "/healthz", healthHandler)
+r.MethodFunc("POST", "/events", receiveEventHandler)
+```
+
+</Accordion>
+
+---
+
+## HTTP Verb Shortcuts
+
+Each of the following methods registers a route for the corresponding HTTP method. They all share the same signature:
+
+```go title="chi.go"
+Connect(pattern string, h http.HandlerFunc)
+Delete(pattern string, h http.HandlerFunc)
+Get(pattern string, h http.HandlerFunc)
+Head(pattern string, h http.HandlerFunc)
+Options(pattern string, h http.HandlerFunc)
+Patch(pattern string, h http.HandlerFunc)
+Post(pattern string, h http.HandlerFunc)
+Put(pattern string, h http.HandlerFunc)
+Trace(pattern string, h http.HandlerFunc)
+```
+
+<ParamField path="pattern" type="string" required>
+  The URL pattern, starting with `/`. Supports named parameters (`{id}`), regex parameters (`{id:\\d+}`), and wildcards (`*`).
+</ParamField>
+
+<ParamField path="h" type="http.HandlerFunc" required>
+  The handler function to execute when the method and pattern match.
+</ParamField>
+
+```go title="routes.go"
+r.Get("/users", listUsers)
+r.Post("/users", createUser)
+r.Put("/users/{id}", updateUser)
+r.Patch("/users/{id}", patchUser)
+r.Delete("/users/{id}", deleteUser)
+r.Head("/users/{id}", headUser)
+r.Options("/users", optionsUser)
+```
+
+<Tip>
+  URL parameter patterns: `{name}` matches any segment, `{name:\\d+}` applies a regexp, `{:\\d+}` is an anonymous regexp match, and `*` matches the remainder of the path including slashes.
+</Tip>
+
+---
+
+## Error Handler Methods
+
+<Accordion title="NotFound — custom 404 handler">
+
+```go title="chi.go"
+NotFound(h http.HandlerFunc)
+```
+
+Sets a custom handler to respond when no route matches the request path. The default behaviour is `http.NotFound` (status 404 with a plain text body). When set on an inline group, the handler is propagated to the parent mux.
+
+<ParamField path="h" type="http.HandlerFunc" required>
+  The handler to invoke for unmatched routes.
+</ParamField>
+
+```go title="main.go"
+r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusNotFound)
+    w.Write([]byte(`{"error":"not found"}`))
+})
+```
+
+</Accordion>
+
+<Accordion title="MethodNotAllowed — custom 405 handler">
+
+```go title="chi.go"
+MethodNotAllowed(h http.HandlerFunc)
+```
+
+Sets a custom handler to respond when the path matches a known route but the HTTP method does not. The default handler returns status 405 and sets the `Allow` header to the list of permitted methods. Propagates to sub-routers like `NotFound`.
+
+<ParamField path="h" type="http.HandlerFunc" required>
+  The handler to invoke when the method is not allowed for the matched path.
+</ParamField>
+
+```go title="main.go"
+r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusMethodNotAllowed)
+    w.Write([]byte(`{"error":"method not allowed"}`))
+})
+```
+
+</Accordion>

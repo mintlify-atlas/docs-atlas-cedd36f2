@@ -1,0 +1,356 @@
+---
+title: "chi Routes Interface, Route Type, and Middleware Chain"
+sidebarTitle: "Routes"
+description: "Reference for chi's Routes interface, Route struct, Middlewares type, and the Chain helper for composing middleware stacks outside a router."
+---
+
+The `Routes` interface exposes chi's routing tree for inspection and testing without making an actual HTTP request. It is embedded in the [`Router`](/api/router) interface, so every chi router automatically satisfies it. The `docgen` sub-package uses this interface to generate human-readable API documentation straight from a live router.
+
+---
+
+## Routes Interface
+
+```go title="chi.go"
+type Routes interface {
+    Routes() []Route
+    Middlewares() Middlewares
+    Match(rctx *Context, method, path string) bool
+    Find(rctx *Context, method, path string) string
+}
+```
+
+### `Routes() []Route`
+
+```go title="mux.go"
+func (mx *Mux) Routes() []Route
+```
+
+Returns a snapshot of the entire routing tree as a flat slice of `Route` values. Each entry describes one registered pattern, the HTTP methods it handles, and — for mounted sub-routers — the sub-router itself.
+
+<ResponseField name="" type="[]Route">
+  A traversable slice of all registered routes in the trie. The order reflects the internal trie walk.
+</ResponseField>
+
+```go title="walk_routes.go"
+r := chi.NewRouter()
+r.Get("/users", listUsers)
+r.Post("/users", createUser)
+r.Get("/users/{id}", getUser)
+
+for _, route := range r.Routes() {
+    for method := range route.Handlers {
+        fmt.Printf("%s %s\n", method, route.Pattern)
+    }
+}
+// GET  /users
+// POST /users
+// GET  /users/{id}
+```
+
+<Tip>
+  Walk sub-routers recursively by checking whether `route.SubRoutes` is non-nil and calling `.Routes()` on it again.
+</Tip>
+
+```go title="walk_routes_recursive.go"
+func walkRoutes(routes chi.Routes, depth int) {
+    indent := strings.Repeat("  ", depth)
+    for _, route := range routes.Routes() {
+        for method := range route.Handlers {
+            fmt.Printf("%s%s %s\n", indent, method, route.Pattern)
+        }
+        if route.SubRoutes != nil {
+            walkRoutes(route.SubRoutes, depth+1)
+        }
+    }
+}
+```
+
+---
+
+### `Middlewares() Middlewares`
+
+```go title="mux.go"
+func (mx *Mux) Middlewares() Middlewares
+```
+
+Returns the slice of middleware handler functions registered on this router via `Use()`. For inline sub-routers this reflects only the middlewares added at that scope level.
+
+<ResponseField name="" type="Middlewares">
+  The ordered slice of middleware functions; may be empty but never nil.
+</ResponseField>
+
+```go title="inspect.go"
+mws := r.Middlewares()
+fmt.Printf("router has %d middleware(s)\n", len(mws))
+```
+
+---
+
+### `Match`
+
+```go title="chi.go / mux.go"
+func (mx *Mux) Match(rctx *Context, method, path string) bool
+```
+
+Searches the routing tree for a handler that matches the given method and path, populating `rctx` with URL parameters and matched patterns — exactly like a real request, but without executing the handler.
+
+<ParamField path="rctx" type="*Context" required>
+  A routing context to receive match results (URL params, route patterns). Create a fresh one with `chi.NewRouteContext()` to avoid state pollution.
+</ParamField>
+
+<ParamField path="method" type="string" required>
+  The HTTP method to match, e.g. `"GET"`.
+</ParamField>
+
+<ParamField path="path" type="string" required>
+  The URL path to test, e.g. `"/users/42"`.
+</ParamField>
+
+<ResponseField name="" type="bool">
+  `true` when a matching handler was found; `false` otherwise.
+</ResponseField>
+
+<Warning>
+  The `*Context` is mutated during the search. Always pass a freshly allocated context from `chi.NewRouteContext()` or call `rctx.Reset()` between calls to avoid leaking state from a previous match.
+</Warning>
+
+```go title="router_test.go"
+func TestRouteMatch(t *testing.T) {
+    r := chi.NewRouter()
+    r.Get("/users/{id}", getUser)
+
+    rctx := chi.NewRouteContext()
+    if !r.Match(rctx, "GET", "/users/99") {
+        t.Fatal("expected match")
+    }
+    t.Log("matched:", chi.URLParamFromCtx(rctx, "id")) // "99"
+}
+```
+
+---
+
+### `Find`
+
+```go title="chi.go / mux.go"
+func (mx *Mux) Find(rctx *Context, method, path string) string
+```
+
+Searches the routing tree and returns the matched **route pattern** string rather than a boolean. Like `Match`, it populates `rctx` without executing any handler. Returns an empty string when nothing matches.
+
+<ParamField path="rctx" type="*Context" required>
+  A routing context to receive match state.
+</ParamField>
+
+<ParamField path="method" type="string" required>
+  The HTTP method to search for.
+</ParamField>
+
+<ParamField path="path" type="string" required>
+  The URL path to search for.
+</ParamField>
+
+<ResponseField name="" type="string">
+  The matched route pattern, e.g. `"/users/{id}"`, or `""` if no match.
+</ResponseField>
+
+```go title="router_test.go"
+rctx := chi.NewRouteContext()
+pattern := r.Find(rctx, "DELETE", "/articles/7")
+fmt.Println(pattern) // "/articles/{id}"
+```
+
+---
+
+## Route Struct
+
+Each element of the `[]Route` slice returned by `Routes()` has the following shape (from the chi tree package):
+
+```go title="tree.go (internal)"
+type Route struct {
+    Pattern   string
+    Handlers  map[string]http.Handler
+    SubRoutes Routes
+}
+```
+
+<ResponseField name="Pattern" type="string">
+  The full URL pattern for this route node, e.g. `"/users/{id}"`.
+</ResponseField>
+
+<ResponseField name="Handlers" type="map[string]http.Handler">
+  A map from HTTP method strings (e.g. `"GET"`, `"POST"`) to their registered `http.Handler`. The key `"*"` represents a catch-all for any method.
+</ResponseField>
+
+<ResponseField name="SubRoutes" type="Routes">
+  Non-nil for routes created via `Mount` or `Route`. Contains the mounted sub-router, allowing recursive traversal of the entire routing tree.
+</ResponseField>
+
+---
+
+## Middlewares Type
+
+```go title="chi.go"
+type Middlewares []func(http.Handler) http.Handler
+```
+
+`Middlewares` is a named slice type for standard middleware functions. Beyond acting as a plain slice, it carries the `Handler` and `HandlerFunc` methods from `chain.go` that let you compose a full `http.Handler` from the stack without attaching the chain to a router.
+
+---
+
+## Chain — Composing Middleware Outside a Router
+
+`Chain` and the `Middlewares` methods in `chain.go` allow you to build a reusable middleware stack that can be applied to individual handlers without going through a `Mux`.
+
+### `Chain`
+
+```go title="chain.go"
+func Chain(middlewares ...func(http.Handler) http.Handler) Middlewares
+```
+
+Wraps the provided middleware functions in the `Middlewares` type and returns them, enabling the `.Handler` and `.HandlerFunc` methods.
+
+<ParamField path="middlewares" type="...func(http.Handler) http.Handler" required>
+  The ordered middleware functions to include in the chain. Executed left-to-right.
+</ParamField>
+
+<ResponseField name="" type="Middlewares">
+  A `Middlewares` slice ready to have a final handler attached.
+</ResponseField>
+
+```go title="chain_example.go"
+stack := chi.Chain(
+    middleware.Logger,
+    middleware.Recoverer,
+    requireAuth,
+)
+
+http.Handle("/secure", stack.HandlerFunc(secureHandler))
+```
+
+---
+
+### `Middlewares.Handler`
+
+```go title="chain.go"
+func (mws Middlewares) Handler(h http.Handler) http.Handler
+```
+
+Builds and returns a `*ChainHandler` by wrapping `h` with the full middleware stack. Middlewares execute in the order they were passed to `Chain`.
+
+<ParamField path="h" type="http.Handler" required>
+  The final endpoint handler to wrap.
+</ParamField>
+
+<ResponseField name="" type="http.Handler">
+  A `*ChainHandler` that, when served, runs the entire middleware chain before calling `h`.
+</ResponseField>
+
+```go title="chain_example.go"
+composed := chi.Chain(
+    middleware.RealIP,
+    middleware.Logger,
+).Handler(myHandler)
+
+http.ListenAndServe(":8080", composed)
+```
+
+---
+
+### `Middlewares.HandlerFunc`
+
+```go title="chain.go"
+func (mws Middlewares) HandlerFunc(h http.HandlerFunc) http.Handler
+```
+
+Identical to `Handler` but accepts a `http.HandlerFunc` for convenience.
+
+<ParamField path="h" type="http.HandlerFunc" required>
+  The final endpoint handler function to wrap.
+</ParamField>
+
+<ResponseField name="" type="http.Handler">
+  A `*ChainHandler` wrapping the provided function with the middleware stack.
+</ResponseField>
+
+```go title="chain_example.go"
+composed := chi.Chain(middleware.Logger).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    w.Write([]byte("ok"))
+})
+```
+
+---
+
+## ChainHandler
+
+`Chain`/`Handler`/`HandlerFunc` all produce a `*ChainHandler`:
+
+```go title="chain.go"
+type ChainHandler struct {
+    Endpoint    http.Handler
+    chain       http.Handler
+    Middlewares Middlewares
+}
+```
+
+<ResponseField name="Endpoint" type="http.Handler">
+  The unwrapped final handler, accessible for inspection or testing without running the middleware stack.
+</ResponseField>
+
+<ResponseField name="Middlewares" type="Middlewares">
+  The middleware functions in use by this chain, in execution order.
+</ResponseField>
+
+`ChainHandler` itself satisfies `http.Handler` via `ServeHTTP`, which delegates to the private `chain` field (the fully composed handler).
+
+---
+
+## Example: Using Routes for Documentation Generation
+
+The `docgen` pattern — enumerating all registered routes programmatically — is a common use case for the `Routes` interface:
+
+```go title="docgen_example.go"
+package main
+
+import (
+    "fmt"
+    "net/http"
+    "strings"
+
+    "github.com/go-chi/chi/v5"
+)
+
+func printRoutes(r chi.Router) {
+    walkFn := func(routes chi.Routes, prefix string) {
+        for _, route := range routes.Routes() {
+            for method := range route.Handlers {
+                if method == "*" {
+                    continue
+                }
+                fmt.Printf("%-8s %s%s\n", method, prefix, route.Pattern)
+            }
+            if route.SubRoutes != nil {
+                trimmed := strings.TrimSuffix(route.Pattern, "/*")
+                printRoutes(route.SubRoutes.(chi.Router), prefix+trimmed)
+            }
+        }
+    }
+    walkFn(r, "")
+}
+
+func main() {
+    r := chi.NewRouter()
+    r.Get("/", indexHandler)
+    r.Route("/api/v1", func(r chi.Router) {
+        r.Get("/users", listUsers)
+        r.Post("/users", createUser)
+        r.Get("/users/{id}", getUser)
+    })
+
+    printRoutes(r)
+    http.ListenAndServe(":3000", r)
+}
+```
+
+<Note>
+  The `docgen` package at `github.com/go-chi/chi/v5/docgen` provides production-ready helpers that walk the `Routes` tree and emit Markdown, JSON, or other formats. It relies entirely on the `Routes` interface — no reflection or code generation required.
+</Note>

@@ -1,0 +1,426 @@
+---
+title: "chi Built-In Middleware Handlers: Complete Reference Guide"
+sidebarTitle: "Built-In"
+description: "Complete reference for every handler in chi's optional middleware package — logging, resilience, compression, path rewriting, security, and more."
+---
+
+Chi ships an optional `github.com/go-chi/chi/v5/middleware` package that provides a comprehensive suite of production-ready `net/http` middleware handlers. Every handler follows the standard `func(http.Handler) http.Handler` signature, so they compose freely with each other and with any other compatible community packages.
+
+## Recommended base stack
+
+A sensible starting point for production services includes request identification, client IP capture, logging, panic recovery, and a request timeout:
+
+```go base_stack.go
+package main
+
+import (
+    "net/http"
+    "time"
+
+    "github.com/go-chi/chi/v5"
+    "github.com/go-chi/chi/v5/middleware"
+)
+
+func main() {
+    r := chi.NewRouter()
+
+    r.Use(middleware.RequestID)
+    r.Use(middleware.ClientIPFromRemoteAddr) // pick one ClientIPFrom* — see Client IP docs
+    r.Use(middleware.Logger)                 // Logger should come before Recoverer
+    r.Use(middleware.Recoverer)
+    r.Use(middleware.Timeout(60 * time.Second))
+
+    r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("hi"))
+    })
+
+    http.ListenAndServe(":3333", r)
+}
+```
+
+<Note>
+  `middleware.Logger` should be registered **before** `middleware.Recoverer`. Logger records the request when it starts; Recoverer intercepts panics after. Reversing the order means a panic would unwind past Logger before it writes the final log line.
+</Note>
+
+---
+
+## Logging & Observability
+
+### Logger
+
+`Logger` logs the start and end of each request, including the HTTP method, path, response status code, bytes written, elapsed time, and client IP. When standard output is a TTY, output is colour-coded by status range.
+
+```go signature
+func Logger(next http.Handler) http.Handler
+```
+
+```go logger_usage.go
+r.Use(middleware.Logger)
+```
+
+To use a custom log formatter, call `RequestLogger` with a `LogFormatter` implementation:
+
+```go custom_logger.go
+r.Use(middleware.RequestLogger(&middleware.DefaultLogFormatter{
+    Logger:  log.New(os.Stdout, "", log.LstdFlags),
+    NoColor: true,
+}))
+```
+
+### RequestID
+
+`RequestID` injects a unique request ID into the context of every request. The ID has the form `host.example.com/random-000001`. If the incoming request already carries an `X-Request-Id` header, that value is used instead.
+
+```go signature
+func RequestID(next http.Handler) http.Handler
+```
+
+```go request_id_usage.go
+r.Use(middleware.RequestID)
+
+// Retrieve the ID from a handler or downstream middleware:
+// reqID := middleware.GetReqID(r.Context())
+```
+
+### Profiler
+
+`Profiler` mounts `net/http/pprof` and `expvar` endpoints under a sub-router. Mount it at a protected path in non-public environments.
+
+```go signature
+func Profiler() http.Handler
+```
+
+```go profiler_usage.go
+func MyService() http.Handler {
+    r := chi.NewRouter()
+    // Only expose profiler endpoints on a private path
+    r.Mount("/debug", middleware.Profiler())
+    return r
+}
+```
+
+### Heartbeat
+
+`Heartbeat` responds to `GET` or `HEAD` requests at the specified path with a `200 OK` and a single `.` body, bypassing all route handlers. Useful for load balancer health checks.
+
+```go signature
+func Heartbeat(endpoint string) func(http.Handler) http.Handler
+```
+
+```go heartbeat_usage.go
+r.Use(middleware.Heartbeat("/ping"))
+```
+
+---
+
+## Resilience
+
+### Recoverer
+
+`Recoverer` catches any panic in a downstream handler, logs the stack trace, and returns `HTTP 500`. It re-panics `http.ErrAbortHandler` so WebSocket connections are still cleanly aborted.
+
+```go signature
+func Recoverer(next http.Handler) http.Handler
+```
+
+```go recoverer_usage.go
+r.Use(middleware.Recoverer)
+```
+
+### Timeout
+
+`Timeout` sets a deadline on the request context. Handlers that respect `ctx.Done()` will be signalled when the deadline expires; after the handler returns, the middleware writes `HTTP 504 Gateway Timeout` if the context deadline was exceeded.
+
+```go signature
+func Timeout(timeout time.Duration) func(next http.Handler) http.Handler
+```
+
+```go timeout_usage.go
+r.Use(middleware.Timeout(30 * time.Second))
+```
+
+```go timeout_handler.go
+// Handlers must select on ctx.Done() to respect the timeout signal.
+r.Get("/slow", func(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    select {
+    case <-ctx.Done():
+        return // deadline exceeded — stop processing
+    case <-time.After(5 * time.Second):
+        w.Write([]byte("done"))
+    }
+})
+```
+
+<Warning>
+  `Timeout` signals via context cancellation — it does not forcibly kill goroutines. Handlers that block on I/O without checking `ctx.Done()` will continue running after the 504 is already sent to the client.
+</Warning>
+
+### Throttle
+
+`Throttle` caps the number of concurrently in-flight requests across all users. Requests that exceed the limit receive `HTTP 429 Too Many Requests`. Use `ThrottleBacklog` to hold excess requests in a queue before rejecting them.
+
+```go signature
+func Throttle(limit int) func(http.Handler) http.Handler
+func ThrottleBacklog(limit, backlogLimit int, backlogTimeout time.Duration) func(http.Handler) http.Handler
+func ThrottleWithOpts(opts ThrottleOpts) func(http.Handler) http.Handler
+```
+
+```go throttle_usage.go
+// Allow at most 20 concurrent requests
+r.Use(middleware.Throttle(20))
+
+// Allow 20 concurrent + queue up to 50 more for up to 30 seconds
+r.Use(middleware.ThrottleBacklog(20, 50, 30*time.Second))
+```
+
+---
+
+## Request Processing
+
+### Compress
+
+`Compress` applies gzip or deflate response encoding for clients that advertise support via the `Accept-Encoding` header. Pass a compression level from the `compress/flate` package and an optional list of content types to compress (defaults to a sensible set of text and JSON types).
+
+```go signature
+func Compress(level int, types ...string) func(next http.Handler) http.Handler
+```
+
+```go compress_usage.go
+// Level 5 is a sensible trade-off between size and CPU.
+r.Use(middleware.Compress(5))
+
+// Compress only JSON and HTML responses:
+r.Use(middleware.Compress(5, "application/json", "text/html"))
+```
+
+For advanced control — custom encoders, Brotli support — use `NewCompressor` directly:
+
+```go compressor_brotli.go
+compressor := middleware.NewCompressor(5, "text/html", "application/json")
+// compressor.SetEncoder("br", brotliEncoderFunc)
+r.Use(compressor.Handler)
+```
+
+### AllowContentType
+
+`AllowContentType` enforces an allowlist of request `Content-Type` values, responding with `HTTP 415 Unsupported Media Type` if the type is not permitted. Requests with no body (zero `Content-Length`) pass through without being checked.
+
+```go signature
+func AllowContentType(contentTypes ...string) func(next http.Handler) http.Handler
+```
+
+```go allow_content_type_usage.go
+r.Use(middleware.AllowContentType("application/json", "application/xml"))
+```
+
+### AllowContentEncoding
+
+`AllowContentEncoding` enforces an allowlist of request `Content-Encoding` values, responding with `HTTP 415` for any encoding not in the list.
+
+```go signature
+func AllowContentEncoding(contentEncoding ...string) func(next http.Handler) http.Handler
+```
+
+```go allow_content_encoding_usage.go
+r.Use(middleware.AllowContentEncoding("gzip", "deflate"))
+```
+
+### ContentCharset
+
+`ContentCharset` responds with `HTTP 415` when the `Content-Type` charset parameter is not in the provided list. An empty string in the list allows requests with no charset specified.
+
+```go signature
+func ContentCharset(charsets ...string) func(next http.Handler) http.Handler
+```
+
+```go content_charset_usage.go
+r.Use(middleware.ContentCharset("utf-8", ""))
+```
+
+---
+
+## Path & URL
+
+### StripSlashes
+
+`StripSlashes` removes a trailing `/` from the request path and re-routes, so `/articles/` matches the same handler as `/articles`.
+
+```go signature
+func StripSlashes(next http.Handler) http.Handler
+```
+
+```go strip_slashes_usage.go
+r.Use(middleware.StripSlashes)
+```
+
+### RedirectSlashes
+
+`RedirectSlashes` issues a `301` redirect stripping the trailing slash, so clients update their bookmarks or links.
+
+```go signature
+func RedirectSlashes(next http.Handler) http.Handler
+```
+
+```go redirect_slashes_usage.go
+r.Use(middleware.RedirectSlashes)
+```
+
+<Note>
+  `RedirectSlashes` is incompatible with `http.FileServer`. Use `StripSlashes` in applications that also serve static files.
+</Note>
+
+### CleanPath
+
+`CleanPath` normalises double slashes in the request path (e.g., `/users//1` → `/users/1`).
+
+```go signature
+func CleanPath(next http.Handler) http.Handler
+```
+
+```go clean_path_usage.go
+r.Use(middleware.CleanPath)
+```
+
+### URLFormat
+
+`URLFormat` parses the file-extension suffix from the URL path, stores it in the context under `middleware.URLFormatCtxKey`, and trims it from the routing path so the route pattern does not need to account for it.
+
+```go signature
+func URLFormat(next http.Handler) http.Handler
+```
+
+```go url_format_usage.go
+r.Use(middleware.URLFormat)
+
+r.Get("/articles/{id}", func(w http.ResponseWriter, r *http.Request) {
+    // /articles/1.json  → format == "json"
+    // /articles/1.xml   → format == "xml"
+    // /articles/1       → format == ""
+    format, _ := r.Context().Value(middleware.URLFormatCtxKey).(string)
+    _ = format
+})
+```
+
+### GetHead
+
+`GetHead` automatically routes undefined `HEAD` requests to their corresponding `GET` handler. Only the response headers are sent; the body is discarded.
+
+```go signature
+func GetHead(next http.Handler) http.Handler
+```
+
+```go get_head_usage.go
+r.Use(middleware.GetHead)
+```
+
+---
+
+## Security & Headers
+
+### BasicAuth
+
+`BasicAuth` adds HTTP Basic authentication to a route or router. Credentials are compared with `crypto/subtle.ConstantTimeCompare` to defend against timing attacks.
+
+```go signature
+func BasicAuth(realm string, creds map[string]string) func(next http.Handler) http.Handler
+```
+
+```go basic_auth_usage.go
+r.Use(middleware.BasicAuth("Admin Area", map[string]string{
+    "admin": "supersecret",
+    "user":  "password",
+}))
+```
+
+### NoCache
+
+`NoCache` sets response headers that instruct both proxy caches and browsers not to cache the response: `Cache-Control: no-cache, no-store, …`, `Pragma: no-cache`, and `Expires` set to the Unix epoch. It also strips incoming ETag-related request headers.
+
+```go signature
+func NoCache(h http.Handler) http.Handler
+```
+
+```go nocache_usage.go
+r.Use(middleware.NoCache)
+```
+
+### SetHeader
+
+`SetHeader` is a convenience middleware that sets a single response header key/value pair on every response.
+
+```go signature
+func SetHeader(key, value string) func(next http.Handler) http.Handler
+```
+
+```go setheader_usage.go
+r.Use(middleware.SetHeader("X-Content-Type-Options", "nosniff"))
+r.Use(middleware.SetHeader("X-Frame-Options", "DENY"))
+```
+
+### WithValue
+
+`WithValue` is a convenience middleware that stores a static key/value pair on the request context, equivalent to calling `context.WithValue` inside a custom middleware.
+
+```go signature
+func WithValue(key, val interface{}) func(next http.Handler) http.Handler
+```
+
+```go with_value_usage.go
+r.Use(middleware.WithValue("version", "v2"))
+```
+
+---
+
+## Sunset
+
+`Sunset` adds `Sunset` and `Deprecation` headers to every response, signalling to API clients that the endpoint is scheduled for removal. Optionally include `Link` headers pointing to successor documentation.
+
+```go signature
+func Sunset(sunsetAt time.Time, links ...string) func(http.Handler) http.Handler
+```
+
+```go sunset_usage.go
+r.Use(middleware.Sunset(
+    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+    `<https://api.example.com/v2>; rel="successor-version"`,
+))
+```
+
+---
+
+## Complete middleware reference
+
+| Middleware | Signature style | Category |
+|---|---|---|
+| `Logger` | `func(http.Handler) http.Handler` | Logging |
+| `RequestLogger(f)` | `func(http.Handler) http.Handler` | Logging |
+| `RequestID` | `func(http.Handler) http.Handler` | Observability |
+| `Profiler()` | `http.Handler` (mount with `r.Mount`) | Observability |
+| `Heartbeat(endpoint)` | `func(http.Handler) http.Handler` | Observability |
+| `Recoverer` | `func(http.Handler) http.Handler` | Resilience |
+| `Timeout(d)` | `func(http.Handler) http.Handler` | Resilience |
+| `Throttle(n)` | `func(http.Handler) http.Handler` | Resilience |
+| `ThrottleBacklog(n, bl, d)` | `func(http.Handler) http.Handler` | Resilience |
+| `Compress(level, types...)` | `func(http.Handler) http.Handler` | Request Processing |
+| `AllowContentType(types...)` | `func(http.Handler) http.Handler` | Request Processing |
+| `AllowContentEncoding(enc...)` | `func(http.Handler) http.Handler` | Request Processing |
+| `ContentCharset(cs...)` | `func(http.Handler) http.Handler` | Request Processing |
+| `StripSlashes` | `func(http.Handler) http.Handler` | Path & URL |
+| `RedirectSlashes` | `func(http.Handler) http.Handler` | Path & URL |
+| `CleanPath` | `func(http.Handler) http.Handler` | Path & URL |
+| `URLFormat` | `func(http.Handler) http.Handler` | Path & URL |
+| `GetHead` | `func(http.Handler) http.Handler` | Path & URL |
+| `BasicAuth(realm, creds)` | `func(http.Handler) http.Handler` | Security |
+| `NoCache` | `func(http.Handler) http.Handler` | Security |
+| `SetHeader(key, val)` | `func(http.Handler) http.Handler` | Security |
+| `WithValue(key, val)` | `func(http.Handler) http.Handler` | Context |
+| `Sunset(time, links...)` | `func(http.Handler) http.Handler` | API Lifecycle |
+| `ClientIPFromRemoteAddr` | `func(http.Handler) http.Handler` | Client IP |
+| `ClientIPFromHeader(h)` | `func(http.Handler) http.Handler` | Client IP |
+| `ClientIPFromXFF(cidrs...)` | `func(http.Handler) http.Handler` | Client IP |
+| `ClientIPFromXFFTrustedProxies(n)` | `func(http.Handler) http.Handler` | Client IP |
+
+<Tip>
+  The `Profiler()` handler returns an `http.Handler` (a pre-built sub-router), not a middleware function. Mount it with `r.Mount("/debug", middleware.Profiler())` rather than `r.Use()`.
+</Tip>

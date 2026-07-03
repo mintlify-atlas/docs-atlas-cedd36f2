@@ -1,0 +1,126 @@
+{
+  "projectType": "framework",
+  "projectName": "chi",
+  "projectDescription": "A lightweight, idiomatic, and composable HTTP router for building Go REST API services with zero external dependencies.",
+  "theme": "luma",
+  "primaryColor": "#84c41c",
+  "lightColor": "#04943c",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "routing/overview",
+              "routing/url-parameters",
+              "routing/subrouters",
+              "routing/mounting"
+            ]
+          },
+          {
+            "group": "Middleware",
+            "pages": [
+              "middleware/overview",
+              "middleware/built-in",
+              "middleware/client-ip",
+              "middleware/custom"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/rest-api",
+              "guides/context",
+              "guides/testing",
+              "guides/ecosystem"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Router",
+            "pages": [
+              "api/router",
+              "api/mux",
+              "api/routes"
+            ]
+          },
+          {
+            "group": "Middleware Reference",
+            "pages": [
+              "api/middleware-reference"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Lightweight (~1000 LOC) Patricia Radix trie router",
+    "100% compatible with net/http standard library",
+    "No external dependencies",
+    "Composable middleware stack using standard net/http middleware handlers",
+    "Context-based URL parameter storage via Go's context package",
+    "Route grouping, subrouters, and handler mounting",
+    "Inline middleware with .With()",
+    "Built-in middleware package with 25+ production-ready handlers",
+    "Regex URL pattern support",
+    "Wildcard and named URL parameters"
+  ],
+  "publicApiSurface": [
+    "chi.NewRouter() *Mux",
+    "chi.NewMux() *Mux",
+    "chi.URLParam(r *http.Request, key string) string",
+    "chi.URLParamFromCtx(ctx context.Context, key string) string",
+    "chi.RouteContext(ctx context.Context) *Context",
+    "chi.NewRouteContext() *Context",
+    "Router.Use(middlewares ...func(http.Handler) http.Handler)",
+    "Router.With(middlewares ...func(http.Handler) http.Handler) Router",
+    "Router.Group(fn func(r Router)) Router",
+    "Router.Route(pattern string, fn func(r Router)) Router",
+    "Router.Mount(pattern string, h http.Handler)",
+    "Router.Handle(pattern string, h http.Handler)",
+    "Router.HandleFunc(pattern string, h http.HandlerFunc)",
+    "Router.Method(method, pattern string, h http.Handler)",
+    "Router.Get / Post / Put / Delete / Patch / Options / Head / Connect / Trace",
+    "Router.NotFound(h http.HandlerFunc)",
+    "Router.MethodNotAllowed(h http.HandlerFunc)",
+    "Routes.Routes() []Route",
+    "Routes.Middlewares() Middlewares",
+    "Routes.Match(rctx *Context, method, path string) bool",
+    "middleware.Logger",
+    "middleware.Recoverer",
+    "middleware.RequestID",
+    "middleware.Timeout(timeout time.Duration)",
+    "middleware.Compress(level int, types ...string)",
+    "middleware.BasicAuth(realm string, creds map[string]string)",
+    "middleware.Throttle(limit int)",
+    "middleware.ClientIPFromRemoteAddr",
+    "middleware.ClientIPFromHeader(header string)",
+    "middleware.ClientIPFromXFF(trustedCIDRs ...string)",
+    "middleware.ClientIPFromXFFTrustedProxies(n int)",
+    "middleware.GetClientIP(ctx context.Context) string",
+    "middleware.NoCache",
+    "middleware.Profiler",
+    "middleware.Heartbeat(endpoint string)",
+    "middleware.URLFormat",
+    "middleware.StripSlashes",
+    "middleware.RedirectSlashes",
+    "middleware.WithValue(key, val interface{})",
+    "middleware.SetHeader(key, value string)"
+  ]
+}

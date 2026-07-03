@@ -1,20 +1,111 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "chi: Lightweight Go HTTP Router"
+sidebarTitle: "Home"
+description: "chi is a lightweight, idiomatic, and composable router for building Go HTTP services with zero external dependencies and full net/http compatibility."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+chi is a small, fast, and composable HTTP router for Go. Built on a Patricia Radix trie, it is 100% compatible with the standard `net/http` library and ships with zero external dependencies. Whether you're building a small microservice or a large REST API, chi scales with your project.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first chi HTTP service in under five minutes with a working example.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Add chi to your Go project using go get and go modules.
+  </Card>
+  <Card title="Routing Overview" icon="route" href="/routing/overview">
+    Learn how chi's radix trie router works, URL patterns, and route groups.
+  </Card>
+  <Card title="Middleware" icon="layer-group" href="/middleware/overview">
+    Explore chi's composable middleware stack and 25+ built-in handlers.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## Why chi?
+
+chi was designed to make large REST API services maintainable as they grow. It brings together the best of the Go standard library with a clean, expressive routing API.
+
+<CardGroup cols={3}>
+  <Card title="Zero Dependencies" icon="circle-check">
+    Only the Go standard library — no external packages, no version conflicts.
+  </Card>
+  <Card title="net/http Compatible" icon="plug">
+    Any middleware or handler compatible with `net/http` works with chi out of the box.
+  </Card>
+  <Card title="Composable" icon="cubes">
+    Build modular services with route groups, sub-routers, and middleware stacks.
+  </Card>
+  <Card title="Context-Aware" icon="bolt">
+    URL parameters and request-scoped values flow through Go's `context.Context`.
+  </Card>
+  <Card title="Fast" icon="gauge-high">
+    Patricia Radix trie routing with minimal allocations per request.
+  </Card>
+  <Card title="Production-Ready" icon="shield-halved">
+    In use at Cloudflare, Heroku, 99Designs, and many others.
+  </Card>
+</CardGroup>
+
+## Get started in three steps
+
+<Steps>
+  <Step title="Install chi">
+    Add chi v5 to your Go module:
+    ```bash
+    go get github.com/go-chi/chi/v5
+    ```
+  </Step>
+  <Step title="Create a router">
+    ```go main.go
+    package main
+
+    import (
+        "net/http"
+
+        "github.com/go-chi/chi/v5"
+        "github.com/go-chi/chi/v5/middleware"
+    )
+
+    func main() {
+        r := chi.NewRouter()
+        r.Use(middleware.Logger)
+        r.Use(middleware.Recoverer)
+
+        r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+            w.Write([]byte("Hello, chi!"))
+        })
+
+        http.ListenAndServe(":3000", r)
+    }
+    ```
+  </Step>
+  <Step title="Run your service">
+    ```bash
+    go run main.go
+    ```
+    Your service is live at `http://localhost:3000`.
+  </Step>
+</Steps>
+
+## Explore the docs
+
+<CardGroup cols={2}>
+  <Card title="Core Concepts" icon="book-open" href="/routing/overview">
+    Understand URL patterns, named parameters, wildcards, and route matching.
+  </Card>
+  <Card title="Built-in Middleware" icon="shield" href="/middleware/built-in">
+    Logger, Recoverer, RequestID, Timeout, Compress, and 20+ more handlers.
+  </Card>
+  <Card title="REST API Guide" icon="code" href="/guides/rest-api">
+    Build a complete REST API with sub-routers, middleware, and context values.
+  </Card>
+  <Card title="API Reference" icon="terminal" href="/api/router">
+    Full reference for the Router interface, Mux, and all public functions.
+  </Card>
+  <Card title="Ecosystem" icon="puzzle-piece" href="/guides/ecosystem">
+    CORS, JWT auth, rate limiting, host routing, and more from the go-chi org.
+  </Card>
+  <Card title="Testing" icon="flask" href="/guides/testing">
+    Test chi handlers and middleware with Go's standard testing package.
+  </Card>
+</CardGroup>

@@ -1,0 +1,219 @@
+---
+title: "chi Sub-Routers: Composing Routes with Route, Group, With"
+sidebarTitle: "Sub-Routers"
+description: "Organise chi routes into sub-routers and groups using r.Route, r.Group, and r.With for scoped middleware stacks and clean, composable API layouts."
+---
+
+chi gives you three complementary tools for breaking a large router into smaller, independently testable pieces: `r.Route` mounts a new sub-router at a path prefix, `r.Group` creates a sibling grouping on the same path with its own middleware stack, and `r.With` adds inline per-route middleware without changing the router structure at all. Together they let you apply middleware exactly where it is needed — no more, no less — while keeping the routing declaration close to the handlers it governs.
+
+## r.Route — sub-router at a path prefix
+
+`r.Route(pattern, fn)` creates a brand-new `*Mux`, passes it to `fn` so you can register routes on it, and then mounts it at `pattern`. Any middleware registered inside `fn` applies only within that sub-router.
+
+```go route-subrouter.go
+r := chi.NewRouter()
+
+r.Route("/articles", func(r chi.Router) {
+	r.Get("/", listArticles)          // GET /articles
+	r.Post("/", createArticle)        // POST /articles
+	r.Get("/search", searchArticles)  // GET /articles/search
+})
+```
+
+Sub-routers nest arbitrarily deep:
+
+```go nested-route.go
+r.Route("/articles", func(r chi.Router) {
+	r.Get("/", listArticles)
+	r.Post("/", createArticle)
+
+	r.Route("/{articleID}", func(r chi.Router) {
+		r.Use(ArticleCtx)            // middleware scoped to /{articleID}
+		r.Get("/", getArticle)       // GET /articles/123
+		r.Put("/", updateArticle)    // PUT /articles/123
+		r.Delete("/", deleteArticle) // DELETE /articles/123
+	})
+})
+```
+
+## r.Group — sibling group on the same path
+
+`r.Group(fn)` creates an **inline** router that shares the current path prefix but gets a fresh middleware stack. Routes inside a group are registered at the same level as their siblings; the group is purely an organisational boundary for middleware.
+
+```go group-example.go
+r := chi.NewRouter()
+
+// Public routes — no authentication required
+r.Group(func(r chi.Router) {
+	r.Get("/", homePage)
+	r.Get("/articles", listArticles)
+})
+
+// Protected routes — require the AuthRequired middleware
+r.Group(func(r chi.Router) {
+	r.Use(AuthRequired)
+	r.Get("/account", accountPage)
+	r.Get("/settings", settingsPage)
+})
+```
+
+<Note>
+  `r.Group` and `r.Route` both produce an inline mux, but `r.Route` also establishes a path
+  prefix. Use `r.Group` when you want middleware isolation without changing the URL structure,
+  and `r.Route` when you want both a new prefix and a new middleware stack.
+</Note>
+
+## r.With — inline per-route middleware
+
+`r.With(middlewares...)` returns a temporary router scoped to a single route registration. It is the most targeted option: the supplied middleware runs only for that specific method–pattern combination and does not affect anything else in the same sub-router.
+
+```go with-example.go
+r := chi.NewRouter()
+
+r.Route("/articles", func(r chi.Router) {
+	// paginate middleware runs only for these two GET routes
+	r.With(paginate).Get("/", listArticles)
+	r.With(paginate).Get("/{month}-{day}-{year}", listArticlesByDate)
+
+	r.Post("/", createArticle) // paginate does NOT run here
+
+	// ArticleCtx runs only on the slug route
+	r.With(ArticleCtx).Get("/{articleSlug:[a-z-]+}", getArticle)
+})
+```
+
+## Middleware isolation in practice
+
+Each sub-router maintains its own middleware slice. Middleware added with `r.Use` inside a `Route` or `Group` callback does not affect the parent router or sibling groups.
+
+<Steps>
+  <Step title="Parent middleware runs first">
+    Middleware registered on the root router (or any ancestor) always executes before the
+    sub-router's own middleware stack.
+  </Step>
+  <Step title="Sub-router middleware is scoped">
+    `r.Use` calls inside a `r.Route` or `r.Group` callback apply only to routes registered
+    within that callback. They have no effect on routes outside it.
+  </Step>
+  <Step title="r.With is the most targeted">
+    `r.With` middleware runs only for the single route it wraps. It is composed at registration
+    time and has no effect on any other route in the same sub-router.
+  </Step>
+</Steps>
+
+## Full articles example
+
+This is the complete articles resource from the chi REST example, showing all three composition tools working together:
+
+```go articles-resource.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+)
+
+func main() {
+	r := chi.NewRouter()
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	// RESTy routes for "articles" resource
+	r.Route("/articles", func(r chi.Router) {
+		r.With(paginate).Get("/", listArticles)                            // GET /articles
+		r.With(paginate).Get("/{month}-{day}-{year}", listArticlesByDate)  // GET /articles/01-16-2017
+
+		r.Post("/", createArticle)                                         // POST /articles
+		r.Get("/search", searchArticles)                                   // GET /articles/search
+
+		// Regexp url parameter:
+		r.Get("/{articleSlug:[a-z-]+}", getArticleBySlug)                 // GET /articles/home-is-toronto
+
+		// Subrouter with ArticleCtx middleware:
+		r.Route("/{articleID}", func(r chi.Router) {
+			r.Use(ArticleCtx)
+			r.Get("/", getArticle)       // GET /articles/123
+			r.Put("/", updateArticle)    // PUT /articles/123
+			r.Delete("/", deleteArticle) // DELETE /articles/123
+		})
+	})
+
+	http.ListenAndServe(":3333", r)
+}
+
+// ArticleCtx middleware loads an *Article from the URL and places it on the context.
+func ArticleCtx(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		articleID := chi.URLParam(r, "articleID")
+		article, err := dbGetArticle(articleID)
+		if err != nil {
+			http.Error(w, http.StatusText(404), 404)
+			return
+		}
+		ctx := context.WithValue(r.Context(), "article", article)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+```
+
+## Resource-based sub-routers
+
+A clean pattern for larger services is to define each resource as a struct with a `Routes()` method that returns a `chi.Router`. The returned router can then be mounted anywhere.
+
+```go todos-resource.go
+type todosResource struct{}
+
+// Routes creates a REST router for the todos resource.
+func (rs todosResource) Routes() chi.Router {
+	r := chi.NewRouter()
+
+	r.Get("/", rs.List)    // GET /todos
+	r.Post("/", rs.Create) // POST /todos
+
+	r.Route("/{id}", func(r chi.Router) {
+		r.Get("/", rs.Get)       // GET /todos/{id}
+		r.Put("/", rs.Update)    // PUT /todos/{id}
+		r.Delete("/", rs.Delete) // DELETE /todos/{id}
+		r.Get("/sync", rs.Sync)  // GET /todos/{id}/sync
+	})
+
+	return r
+}
+```
+
+Mount the resource router in `main`:
+
+```go mount-resource.go
+func main() {
+	r := chi.NewRouter()
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	r.Mount("/todos", todosResource{}.Routes())
+	r.Mount("/users", usersResource{}.Routes())
+
+	http.ListenAndServe(":3333", r)
+}
+```
+
+## Comparison table
+
+| Tool | Creates path prefix | Own middleware stack | Scope |
+|---|---|---|---|
+| `r.Route(pattern, fn)` | ✅ Yes | ✅ Yes | All routes inside `fn` |
+| `r.Group(fn)` | ❌ No | ✅ Yes | All routes inside `fn` |
+| `r.With(mw...).Method(...)` | ❌ No | ✅ Yes | Single route only |
+
+<Tip>
+  Because `r.Route` is shorthand for creating a new router and calling `r.Mount`, you can
+  achieve identical results by constructing a `chi.NewRouter()` separately and mounting it.
+  `r.Route` is simply more concise for inline definitions.
+</Tip>

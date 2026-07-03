@@ -1,0 +1,310 @@
+---
+title: "Using Go context.Context Effectively with chi"
+sidebarTitle: "Context"
+description: "Understand how chi uses Go's context.Context to store URL parameters, pass typed values through middleware chains, and handle cancellation and timeouts."
+---
+
+Go's `context.Context` is the backbone of chi's request lifecycle. Every chi router stores its routing state — URL parameters, matched patterns, and the routing path — directly on the request context. Understanding how this works lets you write middleware and handlers that communicate cleanly without global state or function argument threading.
+
+## What is context.Context?
+
+`context.Context` is a standard library interface that carries deadlines, cancellation signals, and request-scoped values across API boundaries and goroutines. It was introduced in Go 1.7 and is now used throughout the standard library (including `net/http`).
+
+Every `*http.Request` carries a context accessible via `r.Context()`. You can derive a new context with additional values using `context.WithValue`, then attach it back to the request with `r.WithContext(ctx)`.
+
+```go context_basics.go
+// Derive a new context with a key-value pair.
+ctx := context.WithValue(r.Context(), myKey, myValue)
+
+// Attach the updated context to the request and pass it downstream.
+next.ServeHTTP(w, r.WithContext(ctx))
+```
+
+## How chi stores routing state
+
+chi reserves a single context key — `chi.RouteCtxKey` — to store its own `*chi.Context` on the request context. This routing context tracks everything chi needs during the routing lifecycle:
+
+```go chi_context_struct.go
+// chi.Context holds all routing state for a single request.
+type Context struct {
+	Routes Routes
+
+	// Routing path/method override used during sub-router traversal.
+	RoutePath   string
+	RouteMethod string
+
+	// URLParams holds the stack of captured URL parameters across
+	// all sub-routers in the chain.
+	URLParams RouteParams
+
+	// RoutePatterns records all matched patterns across the full
+	// router stack, in order.
+	RoutePatterns []string
+}
+```
+
+Retrieve chi's routing context at any point with:
+
+```go get_route_context.go
+rctx := chi.RouteContext(r.Context())
+```
+
+`RouteContext` is just a typed lookup:
+
+```go route_context_impl.go
+// RouteContext returns chi's *Context from the request context.
+func RouteContext(ctx context.Context) *Context {
+	val, _ := ctx.Value(RouteCtxKey).(*Context)
+	return val
+}
+```
+
+## Accessing URL parameters
+
+chi provides two convenience functions for reading URL parameters.
+
+<CodeGroup>
+
+```go URLParam (from request)
+// chi.URLParam reads a named URL parameter from the request's routing context.
+// Use this in handlers and middleware that already have *http.Request.
+userID := chi.URLParam(r, "userID")
+```
+
+```go URLParamFromCtx (from context)
+// chi.URLParamFromCtx reads a named URL parameter from a context.Context directly.
+// Useful when you only have the context (e.g., in a background goroutine).
+userID := chi.URLParamFromCtx(ctx, "userID")
+```
+
+</CodeGroup>
+
+Both functions look up the parameter on the `chi.Context.URLParams` stack:
+
+```go url_param_lookup.go
+func (x *Context) URLParam(key string) string {
+	// Traverse from the end so the most recent binding wins.
+	for k := len(x.URLParams.Keys) - 1; k >= 0; k-- {
+		if x.URLParams.Keys[k] == key {
+			return x.URLParams.Values[k]
+		}
+	}
+	return ""
+}
+```
+
+<Note>
+  URL parameters are accumulated as the request passes through nested
+  sub-routers. This means a sub-router can read parameters matched by a parent
+  router without any extra wiring.
+</Note>
+
+## Pattern: middleware loads a resource, handler reads it
+
+The most common context pattern in chi is a middleware that resolves a URL parameter into a typed domain object and stores it on the context. Downstream handlers then read the typed value, never dealing with raw IDs or DB calls themselves.
+
+<Steps>
+
+### Define a typed context key
+
+Always use a package-local struct type as the context key. This guarantees no collision with keys set by other packages (including chi itself or third-party middleware).
+
+```go context_keys.go
+package main
+
+// contextKey is an unexported type for context keys in this package.
+type contextKey struct{ name string }
+
+var articleCtxKey = &contextKey{"article"}
+```
+
+### Write the loading middleware
+
+The middleware reads the `{articleID}` URL parameter with `chi.URLParam`, fetches the resource, and stores it on the context using the typed key.
+
+```go article_ctx_middleware.go
+func ArticleCtx(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		articleID := chi.URLParam(r, "articleID")
+
+		article, err := dbGetArticle(articleID)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+
+		// Store the typed *Article on the context using the private key.
+		ctx := context.WithValue(r.Context(), articleCtxKey, article)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+```
+
+### Read the typed value in the handler
+
+The handler performs a single type assertion to retrieve the value. Because `ArticleCtx` already validated the resource, the handler can focus purely on the response.
+
+```go get_article_handler.go
+func getArticle(w http.ResponseWriter, r *http.Request) {
+	article, ok := r.Context().Value(articleCtxKey).(*Article)
+	if !ok {
+		http.Error(w, http.StatusText(http.StatusUnprocessableEntity), http.StatusUnprocessableEntity)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(article)
+}
+```
+
+### Wire the middleware to the sub-router
+
+Attach `ArticleCtx` to the `/{articleID}` sub-router so it only runs when an article ID is present in the path.
+
+```go router_wiring.go
+r.Route("/articles/{articleID}", func(r chi.Router) {
+	r.Use(ArticleCtx) // loads *Article onto ctx for all routes below
+	r.Get("/", getArticle)
+	r.Put("/", updateArticle)
+	r.Delete("/", deleteArticle)
+})
+```
+
+</Steps>
+
+<Warning>
+  Never use bare string literals (e.g., `"article"` or `"user"`) as context
+  keys in production code. Any other package that happens to use the same
+  string can silently overwrite or read your value. Typed private keys make
+  collisions a compile-time impossibility.
+</Warning>
+
+## Full example: user authentication middleware
+
+Here is a complete, self-contained example showing a user-loading middleware alongside a handler that reads the user from context:
+
+```go auth_middleware_example.go
+package main
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+)
+
+type User struct {
+	ID   int64
+	Name string
+}
+
+// userCtxKey is the private key for storing a *User in the context.
+type userCtxKey struct{}
+
+// UserCtx loads a user from the URL param and sets it on the context.
+func UserCtx(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userID := chi.URLParam(r, "userID")
+		user, err := dbGetUser(userID)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		ctx := context.WithValue(r.Context(), userCtxKey{}, user)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// GetUser reads the *User previously set by UserCtx middleware.
+func GetUser(w http.ResponseWriter, r *http.Request) {
+	user, ok := r.Context().Value(userCtxKey{}).(*User)
+	if !ok || user == nil {
+		http.Error(w, "user not found in context", http.StatusInternalServerError)
+		return
+	}
+	w.Write([]byte("Hello, " + user.Name))
+}
+
+func setupRouter() chi.Router {
+	r := chi.NewRouter()
+	r.Route("/users/{userID}", func(r chi.Router) {
+		r.Use(UserCtx)
+		r.Get("/", GetUser)
+	})
+	return r
+}
+```
+
+## Context cancellation and timeouts
+
+chi's `middleware.Timeout` sets a deadline on the request context. When the deadline is exceeded, `ctx.Done()` is closed and `ctx.Err()` returns `context.DeadlineExceeded`. Long-running handlers should check for cancellation to avoid wasted work:
+
+```go timeout_handler.go
+import (
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
+)
+
+// Apply a 30-second timeout to every request.
+r.Use(middleware.Timeout(30 * time.Second))
+
+// A handler that respects context cancellation.
+func slowHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	resultCh := make(chan string, 1)
+	go func() {
+		// Simulate a slow operation.
+		resultCh <- expensiveOperation()
+	}()
+
+	select {
+	case result := <-resultCh:
+		w.Write([]byte(result))
+	case <-ctx.Done():
+		// The request timed out or was cancelled by the client.
+		http.Error(w, "request timed out", http.StatusServiceUnavailable)
+	}
+}
+```
+
+<Tip>
+  Always pass `r.Context()` into any DB queries, outbound HTTP calls, or
+  long-running operations spawned inside a handler. This ensures they are
+  automatically cancelled when the client disconnects or the timeout fires.
+</Tip>
+
+## Reading the full routing context
+
+Beyond URL parameters, `chi.Context` exposes fields useful for instrumentation and logging:
+
+```go routing_context_fields.go
+func InstrumentMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Call next first so RoutePattern() reflects the final matched pattern.
+		next.ServeHTTP(w, r)
+
+		rctx := chi.RouteContext(r.Context())
+		if rctx != nil {
+			// The full matched pattern, e.g. "/articles/{articleID}"
+			pattern := rctx.RoutePattern()
+
+			// The HTTP method of this request.
+			method := rctx.RouteMethod
+
+			// All patterns matched across sub-routers.
+			patterns := rctx.RoutePatterns
+
+			log.Printf("method=%s pattern=%s all=%v", method, pattern, patterns)
+		}
+	})
+}
+```
+
+| Field            | Type          | Description                                                    |
+| ---------------- | ------------- | -------------------------------------------------------------- |
+| `RoutePath`      | `string`      | Remaining path for sub-router traversal (override only)        |
+| `RouteMethod`    | `string`      | HTTP method of the current request                             |
+| `URLParams`      | `RouteParams` | Stack of all captured `{param}` key/value pairs                |
+| `RoutePatterns`  | `[]string`    | Ordered list of all patterns matched across the router stack   |

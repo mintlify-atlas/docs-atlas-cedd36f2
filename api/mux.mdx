@@ -1,0 +1,302 @@
+---
+title: "chi Mux: The Concrete HTTP Router and Context Pool"
+sidebarTitle: "Mux"
+description: "Deep-dive into chi's Mux struct — ServeHTTP internals, sync.Pool context reuse, inline sub-routers, RouteCtxKey, and the Context type."
+---
+
+`Mux` is chi's concrete, high-performance HTTP router. It implements the [`Router`](/api/router) interface and `http.Handler`, so it can be handed directly to `http.ListenAndServe`. Internally it uses a radix-trie for O(log n) route lookup and a `sync.Pool` to reuse routing context objects across requests, keeping per-request allocations low.
+
+---
+
+## Creating a Mux
+
+```go title="chi.go"
+func NewRouter() *Mux
+```
+
+`chi.NewRouter()` is the canonical constructor. It calls `NewMux()` and returns a fully initialised `*Mux` with an empty radix trie and a pre-warmed `sync.Pool`.
+
+```go title="mux.go"
+func NewMux() *Mux {
+    mux := &Mux{tree: &node{}, pool: &sync.Pool{}}
+    mux.pool.New = func() interface{} {
+        return NewRouteContext()
+    }
+    return mux
+}
+```
+
+```go title="main.go"
+package main
+
+import (
+    "net/http"
+    "github.com/go-chi/chi/v5"
+    "github.com/go-chi/chi/v5/middleware"
+)
+
+func main() {
+    r := chi.NewRouter()
+    r.Use(middleware.Logger)
+    r.Use(middleware.Recoverer)
+
+    r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("root."))
+    })
+
+    http.ListenAndServe(":3333", r)
+}
+```
+
+---
+
+## Mux Struct
+
+```go title="mux.go"
+type Mux struct {
+    handler                 http.Handler
+    tree                    *node
+    methodNotAllowedHandler http.HandlerFunc
+    parent                  *Mux
+    pool                    *sync.Pool
+    notFoundHandler         http.HandlerFunc
+    middlewares             []func(http.Handler) http.Handler
+    inline                  bool
+}
+```
+
+Most fields are unexported. The two behaviorally significant ones are:
+
+<ResponseField name="inline" type="bool">
+  When `true`, this Mux is an inline group (created by `Group` or `With`) rather than a mounted sub-router. Inline muxes share the parent's `sync.Pool` and radix trie but hold their own middleware slice. This flag changes how `NotFound` and `MethodNotAllowed` handlers are propagated and how the middleware chain is built when registering an endpoint.
+</ResponseField>
+
+<ResponseField name="pool" type="*sync.Pool">
+  Holds recycled `*Context` objects. Sub-routers created by `With`/`Group` share the root mux's pool to avoid double-allocation.
+</ResponseField>
+
+---
+
+## ServeHTTP — Request Lifecycle
+
+```go title="mux.go"
+func (mx *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request)
+```
+
+`ServeHTTP` is the single method that makes `Mux` an `http.Handler`. Its steps are:
+
+1. **Guard** — if no routes have been registered (`mx.handler == nil`) the request is immediately passed to the 404 handler.
+2. **Context check** — if a chi `*Context` is already present in the request context (i.e. the request is already inside a parent chi router), routing is delegated to the pre-built handler chain without allocating a new context.
+3. **Pool get** — a `*Context` is retrieved from `sync.Pool`, reset to its zero state, and populated with a reference to the current `Mux` as `rctx.Routes`.
+4. **Context injection** — the context is stored in the request via `context.WithValue(r.Context(), RouteCtxKey, rctx)`.
+5. **Handler execution** — the composed handler (middleware chain + trie router) serves the request.
+6. **Pool put** — after the handler returns, the `*Context` is returned to the pool for reuse.
+
+```go title="mux.go"
+func (mx *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    if mx.handler == nil {
+        mx.NotFoundHandler().ServeHTTP(w, r)
+        return
+    }
+    rctx, _ := r.Context().Value(RouteCtxKey).(*Context)
+    if rctx != nil {
+        mx.handler.ServeHTTP(w, r)
+        return
+    }
+    rctx = mx.pool.Get().(*Context)
+    rctx.Reset()
+    rctx.Routes = mx
+    rctx.parentCtx = r.Context()
+    r = r.WithContext(context.WithValue(r.Context(), RouteCtxKey, rctx))
+    mx.handler.ServeHTTP(w, r)
+    mx.pool.Put(rctx)
+}
+```
+
+<Note>
+  `r.WithContext()` causes 2 allocations and `context.WithValue()` causes 1 allocation per request. The `sync.Pool` reuse of `*Context` means the routing context itself does not contribute an allocation on the hot path for sub-routers.
+</Note>
+
+---
+
+## Inline vs. Mounted Sub-Routers
+
+Chi has two distinct kinds of sub-router, and the `inline` field on `Mux` distinguishes them.
+
+| | Inline (`Group` / `With`) | Mounted (`Route` / `Mount`) |
+|---|---|---|
+| Path prefix | Inherits parent's prefix | Adds a new prefix |
+| Middleware stack | Copy of parent stack + extras | Independent stack |
+| Radix trie | Shared with parent | Own trie |
+| `sync.Pool` | Shared with root | Own pool |
+| `NotFound` propagation | Propagates to parent mux | Independent |
+
+When `inline == true`, calling `NotFound` or `MethodNotAllowed` wraps the provided handler with the inline mux's own middleware chain before propagating it to the parent — so error responses from an inline group still pass through that group's middleware.
+
+```go title="mux.go"
+func (mx *Mux) NotFound(handlerFn http.HandlerFunc) {
+    m := mx
+    hFn := handlerFn
+    if mx.inline && mx.parent != nil {
+        m = mx.parent
+        hFn = Chain(mx.middlewares...).HandlerFunc(hFn).ServeHTTP
+    }
+    m.notFoundHandler = hFn
+    m.updateSubRoutes(func(subMux *Mux) {
+        if subMux.notFoundHandler == nil {
+            subMux.NotFound(hFn)
+        }
+    })
+}
+```
+
+---
+
+## RouteCtxKey
+
+```go title="context.go"
+var RouteCtxKey = &contextKey{"RouteContext"}
+```
+
+`chi.RouteCtxKey` is the `context.Context` key under which the chi `*Context` is stored. It uses a private pointer type (`*contextKey`) as the key to guarantee uniqueness — no accidental collisions with other packages.
+
+Use this key directly only when you need low-level context access. Prefer the `chi.RouteContext(ctx)` helper.
+
+---
+
+## Additional Mux Methods
+
+Beyond the `Router` interface, `Mux` exposes two concrete handler accessors:
+
+### `NotFoundHandler`
+
+```go title="mux.go"
+func (mx *Mux) NotFoundHandler() http.HandlerFunc
+```
+
+Returns the active 404 handler. Falls back to the standard library's `http.NotFound` when no custom handler has been set.
+
+<ResponseField name="" type="http.HandlerFunc">
+  The custom not-found handler, or `http.NotFound` as the default.
+</ResponseField>
+
+---
+
+### `MethodNotAllowedHandler`
+
+```go title="mux.go"
+func (mx *Mux) MethodNotAllowedHandler(methodsAllowed ...methodTyp) http.HandlerFunc
+```
+
+Returns the active 405 handler. The default implementation sets the `Allow` response header to the comma-separated list of allowed methods and writes status 405.
+
+<ResponseField name="" type="http.HandlerFunc">
+  The custom method-not-allowed handler, or the default 405 responder.
+</ResponseField>
+
+---
+
+## The Context Type
+
+`Context` is chi's per-request routing state object. One instance exists for each in-flight request (recycled via `sync.Pool`).
+
+```go title="context.go"
+type Context struct {
+    Routes        Routes
+    RoutePath     string
+    RouteMethod   string
+    URLParams     RouteParams
+    RoutePatterns []string
+    // unexported fields omitted
+}
+```
+
+<ResponseField name="Routes" type="Routes">
+  A reference back to the `Mux` that is currently handling the request. Used internally by `Find` / `Match` to delegate into sub-routers.
+</ResponseField>
+
+<ResponseField name="RoutePath" type="string">
+  An override for the path being routed. Sub-routers set this to the remaining path after stripping the matched prefix, so each router only sees its own segment.
+</ResponseField>
+
+<ResponseField name="RouteMethod" type="string">
+  An override for the HTTP method used during routing. Normally mirrors `r.Method`.
+</ResponseField>
+
+<ResponseField name="URLParams" type="RouteParams">
+  The accumulated stack of named URL parameters captured across all sub-routers in the chain. Read values via `chi.URLParam(r, key)`.
+</ResponseField>
+
+<ResponseField name="RoutePatterns" type="[]string">
+  All routing patterns matched so far across the sub-router stack. The full pattern is assembled by `RoutePattern()`.
+</ResponseField>
+
+---
+
+### `Context.URLParam`
+
+```go title="context.go"
+func (x *Context) URLParam(key string) string
+```
+
+Searches `URLParams` from the end of the stack backwards and returns the most recently captured value for `key`. Returns an empty string when the key is absent.
+
+<ParamField path="key" type="string" required>
+  The named parameter key to look up.
+</ParamField>
+
+<ResponseField name="" type="string">
+  The captured value, or `""` if not present.
+</ResponseField>
+
+---
+
+### `Context.RoutePattern`
+
+```go title="context.go"
+func (x *Context) RoutePattern() string
+```
+
+Joins `RoutePatterns` into a single canonical pattern string and trims any trailing slashes or wildcard artifacts. The returned value is the complete matched pattern from the root mux down through all sub-routers.
+
+<Tip>
+  Call `RoutePattern()` **after** `next.ServeHTTP(w, r)` inside middleware — the pattern is only fully assembled once routing across all sub-routers is complete.
+</Tip>
+
+```go title="middleware.go"
+func Instrument(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        next.ServeHTTP(w, r)
+        pattern := chi.RouteContext(r.Context()).RoutePattern()
+        recordMetric(r.Method, pattern)
+    })
+}
+```
+
+---
+
+## RouteParams
+
+```go title="context.go"
+type RouteParams struct {
+    Keys, Values []string
+}
+```
+
+A compact pair of parallel slices storing URL parameter names and their matched values. Parameters are appended in the order they are captured as routing descends through the trie.
+
+<ResponseField name="Keys" type="[]string">
+  Parameter names in capture order.
+</ResponseField>
+
+<ResponseField name="Values" type="[]string">
+  Corresponding captured values, aligned index-for-index with `Keys`.
+</ResponseField>
+
+### `RouteParams.Add`
+
+```go title="context.go"
+func (s *RouteParams) Add(key, value string)
+```
+
+Appends a key/value pair. Used internally by the radix trie during route matching.
