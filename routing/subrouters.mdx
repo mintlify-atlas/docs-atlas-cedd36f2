@@ -58,9 +58,11 @@ r.Group(func(r chi.Router) {
 ```
 
 <Note>
-  `r.Group` and `r.Route` both produce an inline mux, but `r.Route` also establishes a path
-  prefix. Use `r.Group` when you want middleware isolation without changing the URL structure,
-  and `r.Route` when you want both a new prefix and a new middleware stack.
+  `r.Group` creates an inline mux that shares the parent router's radix trie — routes registered
+  inside are added directly to the parent tree. `r.Route` creates a fully independent sub-router
+  via `chi.NewRouter()` and mounts it at the given prefix. Use `r.Group` when you want middleware
+  isolation without changing the URL structure, and `r.Route` when you want both a new path prefix
+  and a standalone sub-router.
 </Note>
 
 ## r.With — inline per-route middleware

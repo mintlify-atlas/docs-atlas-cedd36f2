@@ -10,7 +10,7 @@ Chi ships four `ClientIPFrom*` middlewares that replace the deprecated `RealIP` 
 
 ## Why `RealIP` is deprecated
 
-The legacy `RealIP` middleware (still present but marked deprecated) reads the leftmost `X-Forwarded-For` value, or falls back to `True-Client-IP` / `X-Real-IP`, and writes the result to `r.RemoteAddr`. This approach is vulnerable to IP spoofing:
+The legacy `RealIP` middleware (still present but marked deprecated) checks `True-Client-IP` first, then `X-Real-IP`, and finally takes the leftmost entry from `X-Forwarded-For`, writing the result to `r.RemoteAddr`. This approach is vulnerable to IP spoofing:
 
 - An attacker can add a fake `X-Forwarded-For` header to any request.
 - If your proxy appends rather than overwrites, the "leftmost" IP is entirely attacker-controlled.

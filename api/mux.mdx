@@ -188,7 +188,7 @@ Returns the active 404 handler. Falls back to the standard library's `http.NotFo
 func (mx *Mux) MethodNotAllowedHandler(methodsAllowed ...methodTyp) http.HandlerFunc
 ```
 
-Returns the active 405 handler. The default implementation sets the `Allow` response header to the comma-separated list of allowed methods and writes status 405.
+Returns the active 405 handler. The `methodsAllowed` variadic parameter is an internal type (`methodTyp`) and is not accessible to callers outside the `chi` package; external code always calls this method with no arguments. The default implementation sets the `Allow` response header to the list of methods permitted for the matched route and writes status 405. This method is called internally by `ServeHTTP` when a path matches but the HTTP method does not; it is also useful for testing the configured 405 response directly.
 
 <ResponseField name="" type="http.HandlerFunc">
   The custom method-not-allowed handler, or the default 405 responder.

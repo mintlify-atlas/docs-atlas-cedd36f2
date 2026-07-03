@@ -4,7 +4,7 @@ sidebarTitle: "Router"
 description: "Complete reference for chi's Router interface — every routing method, HTTP verb shortcut, and global helper function with signatures and examples."
 ---
 
-The `Router` interface is the core contract every chi router implements. It embeds both `http.Handler` and the `Routes` interface, meaning any `Router` value can be passed directly to `http.ListenAndServe` and also supports route introspection. The concrete implementation is [`Mux`](/api/mux), returned by `chi.NewRouter()`.
+The `Router` interface is the core contract every chi router implements. It embeds both `http.Handler` and the `Routes` interface, meaning any `Router` value can be passed directly to `http.ListenAndServe` and also supports route introspection. The concrete implementation is [`Mux`](/api/mux), returned by `chi.NewRouter()`. The `Routes` interface, `Middlewares` type, and related global helpers are all defined in `chi.go` and documented here alongside the `Router` interface.
 
 ---
 
@@ -169,6 +169,81 @@ type Router interface {
     Trace(pattern string, h http.HandlerFunc)
     NotFound(h http.HandlerFunc)
     MethodNotAllowed(h http.HandlerFunc)
+}
+```
+
+`Router` embeds `Routes`, so every method on `Routes` is also available on any `Router`. See the [Routes reference](/api/routes) for `Routes()`, `Middlewares()`, `Match()`, and `Find()`.
+
+---
+
+## Routes Interface
+
+`Routes` is the read-only introspection interface embedded by `Router`. It is also implemented by mounted sub-routers and used by the `docgen` sub-package to enumerate all registered routes.
+
+```go title="chi.go"
+type Routes interface {
+    // Routes returns the routing tree in an easily traversable structure.
+    Routes() []Route
+
+    // Middlewares returns the list of middlewares in use by the router.
+    Middlewares() Middlewares
+
+    // Match searches the routing tree for a handler that matches
+    // the method/path - similar to routing a http request, but without
+    // executing the handler thereafter.
+    Match(rctx *Context, method, path string) bool
+
+    // Find searches the routing tree for the pattern that matches
+    // the method/path.
+    Find(rctx *Context, method, path string) string
+}
+```
+
+See the [Routes reference](/api/routes) for full documentation of each method.
+
+---
+
+## Middlewares Type
+
+```go title="chi.go"
+type Middlewares []func(http.Handler) http.Handler
+```
+
+`Middlewares` is a named slice type for standard middleware functions. It is returned by `Router.Middlewares()` and accepted wherever a middleware stack is expected. It also carries `Handler` and `HandlerFunc` methods (from `chain.go`) so you can compose a complete `http.Handler` from a middleware stack without involving a router at all — see [`Chain`](/api/routes#chain--composing-middleware-outside-a-router).
+
+```go title="example.go"
+var mws chi.Middlewares = []func(http.Handler) http.Handler{
+    middleware.Logger,
+    middleware.Recoverer,
+}
+
+// Compose into a standalone handler
+composed := mws.Handler(myEndpointHandler)
+```
+
+---
+
+## RegisterMethod
+
+```go title="tree.go"
+func RegisterMethod(method string)
+```
+
+Registers a custom HTTP method with chi's internal method map, making it available for use with `Method`, `MethodFunc`, and route matching. Call this once at program startup before registering any routes that use the custom method. The method string is normalised to uppercase. Registering a method that is already known is a no-op. Panics if the maximum number of supported methods is exceeded.
+
+<ParamField path="method" type="string" required>
+  The HTTP method string to register, e.g. `"PROPFIND"`. Normalised to uppercase.
+</ParamField>
+
+```go title="main.go"
+func init() {
+    chi.RegisterMethod("PROPFIND")
+}
+
+func main() {
+    r := chi.NewRouter()
+    r.MethodFunc("PROPFIND", "/dav/{path}", davPropfindHandler)
+    http.ListenAndServe(":3000", r)
 }
 ```
 

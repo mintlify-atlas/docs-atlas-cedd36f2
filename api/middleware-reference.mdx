@@ -23,7 +23,7 @@ func Logger(next http.Handler) http.Handler
 Logs the start and end of every request, including method, URL, remote address, response status, bytes written, and elapsed time. Output is colorized when stdout is a TTY. Prints the request ID when one is present in context.
 
 <Note>
-`Logger` delegates to `middleware.DefaultLogger`, which is a package-level variable. You can swap it for a custom `LogFormatter` at startup without changing your router wiring.
+`Logger` delegates to `middleware.DefaultLogger`, which is a package-level variable of type `func(next http.Handler) http.Handler`. You can swap it for a custom `LogFormatter` at startup without changing your router wiring.
 </Note>
 
 <Warning>
@@ -154,6 +154,7 @@ The profiler registers these routes relative to its mount prefix:
 | `/pprof/symbol` | Symbol lookup |
 | `/pprof/trace` | Execution trace |
 | `/pprof/goroutine` | Goroutine dump |
+| `/pprof/threadcreate` | Thread create |
 | `/pprof/heap` | Heap profile |
 | `/pprof/block` | Block profile |
 | `/pprof/mutex` | Mutex profile |
@@ -369,12 +370,12 @@ r.Post("/api/data", handleData)
 <Accordion title="AllowContentEncoding">
 
 ```go
-func AllowContentEncoding(contentEncodings ...string) func(next http.Handler) http.Handler
+func AllowContentEncoding(contentEncoding ...string) func(next http.Handler) http.Handler
 ```
 
 Enforces a whitelist of acceptable `Content-Encoding` values. All encodings declared in the request header must appear in the allowed list, otherwise the request is rejected with `HTTP 415`. Empty-body requests are skipped.
 
-<ParamField path="contentEncodings" type="...string" required>
+<ParamField path="contentEncoding" type="...string" required>
   Encoding names to permit, e.g. `"gzip"`, `"identity"`. Matching is case-insensitive.
 </ParamField>
 
@@ -418,7 +419,7 @@ Compresses response bodies using `gzip` or `deflate` based on the client's `Acce
   Compression level as defined in the `compress/flate` package. Use `5` as a sensible default, `flate.BestSpeed` for lower CPU cost, or `flate.BestCompression` for maximum ratio.
 </ParamField>
 <ParamField path="types" type="...string">
-  MIME types to compress. Supports wildcard suffixes such as `"text/*"`. If omitted, the built-in list (`text/html`, `text/css`, `application/json`, `image/svg+xml`, and others) is used.
+  MIME types to compress. Supports wildcard suffixes such as `"text/*"`. If omitted, the built-in list (`text/html`, `text/css`, `text/plain`, `text/javascript`, `application/javascript`, `application/json`, `application/atom+xml`, `application/rss+xml`, `image/svg+xml`) is used.
 </ParamField>
 
 <Note>
@@ -516,6 +517,27 @@ r.Get("/docs", docsHandler) // /docs/ redirects to /docs
 
 </Accordion>
 
+<Accordion title="StripPrefix">
+
+```go
+func StripPrefix(prefix string) func(http.Handler) http.Handler
+```
+
+Strips the provided path prefix from the request URL path before passing the request to the next handler.
+
+<ParamField path="prefix" type="string" required>
+  The URL path prefix to strip, e.g. `"/api/v1"`.
+</ParamField>
+
+**Example**
+
+```go
+r.Use(middleware.StripPrefix("/api/v1"))
+r.Get("/users", listUsers) // also matches /api/v1/users
+```
+
+</Accordion>
+
 <Accordion title="CleanPath">
 
 ```go
@@ -586,6 +608,58 @@ r.Get("/resource", resourceHandler)
 
 </Accordion>
 
+<Accordion title="PageRoute">
+
+```go
+func PageRoute(path string, handler http.Handler) func(http.Handler) http.Handler
+```
+
+Routes a static `GET` request to the given handler at the middleware stack level, bypassing the router. Requests at any other path, or with any other method, pass through to the next handler.
+
+<ParamField path="path" type="string" required>
+  The URL path to intercept, matched case-insensitively against `r.URL.Path`.
+</ParamField>
+<ParamField path="handler" type="http.Handler" required>
+  The handler to invoke when the path matches a GET request.
+</ParamField>
+
+**Example**
+
+```go
+r := chi.NewRouter()
+r.Use(middleware.PageRoute("/healthz", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    w.Write([]byte("ok"))
+})))
+r.Get("/", appHandler)
+```
+
+</Accordion>
+
+<Accordion title="PathRewrite">
+
+```go
+func PathRewrite(old, new string) func(http.Handler) http.Handler
+```
+
+Rewrites the request URL path by replacing the first occurrence of `old` with `new` before passing the request to the next handler. Useful for adapting legacy path schemes or normalizing versioned prefixes.
+
+<ParamField path="old" type="string" required>
+  The substring to replace in `r.URL.Path`.
+</ParamField>
+<ParamField path="new" type="string" required>
+  The replacement substring.
+</ParamField>
+
+**Example**
+
+```go
+// Rewrite /v1/users → /users
+r.Use(middleware.PathRewrite("/v1", ""))
+r.Get("/users", listUsers)
+```
+
+</Accordion>
+
 ---
 
 ## Security & Headers
@@ -622,9 +696,9 @@ r.Use(middleware.BasicAuth("Admin Area", map[string]string{
 func NoCache(h http.Handler) http.Handler
 ```
 
-Sets response headers that instruct proxies and browsers never to cache the response. Also removes any ETag-related request headers to prevent conditional-GET short-circuits. Suitable for dynamic API routes, dashboards, and admin endpoints.
+Sets response headers that instruct proxies and browsers never to cache the response. Also removes ETag-related request headers (`ETag`, `If-Modified-Since`, `If-Match`, `If-None-Match`, `If-Range`, `If-Unmodified-Since`) to prevent conditional-GET short-circuits. Suitable for dynamic API routes, dashboards, and admin endpoints.
 
-Headers set:
+Headers set on the response:
 
 | Header | Value |
 |---|---|
@@ -865,10 +939,10 @@ Sets `r.RemoteAddr` to the value of `True-Client-IP`, `X-Real-IP`, or the leftmo
 func New(h http.Handler) func(next http.Handler) http.Handler
 ```
 
-Wraps a plain `http.Handler` as a middleware. The wrapped handler executes before `next` in the chain. Useful for adapting existing `http.Handler` values (e.g. from third-party packages) for use with `r.Use(...)`.
+Wraps a plain `http.Handler` as a middleware. The wrapped handler executes and the request is passed to it; `next` is **never** called — the wrapped handler is the terminal handler in the chain. Useful for adapting existing `http.Handler` values (e.g. from third-party packages) for use with `r.Use(...)`.
 
 <ParamField path="h" type="http.Handler" required>
-  The handler to execute as a middleware. Its response is written before `next` is called; `next` is not called at all if `h` writes a response and returns.
+  The handler to execute as a middleware. It is called for every request; `next` is not invoked.
 </ParamField>
 
 **Example**
@@ -880,7 +954,7 @@ r.Use(middleware.New(corsHandler))
 
 </Accordion>
 
-<Accordion title="WrapResponseWriter / NewWrapResponseWriter">
+<Accordion title="NewWrapResponseWriter">
 
 ```go
 func NewWrapResponseWriter(w http.ResponseWriter, protoMajor int) WrapResponseWriter
@@ -933,22 +1007,28 @@ func myLoggingMiddleware(next http.Handler) http.Handler {
 
 ## Additional Helpers
 
-<CardGroup cols={2}>
-  <Card title="RouteHeaders" icon="route">
-    A header-based middleware router. Chain `.Route(header, match, middleware)` calls to dispatch requests to different middleware stacks based on header values. Supports wildcard matching (`*`).
+<Accordion title="RouteHeaders">
 
-    ```go
-    r.Use(middleware.RouteHeaders().
-        Route("Host", "api.example.com", apiMiddleware).
-        Route("Host", "*.example.com", subdomainMiddleware).
-        Handler)
-    ```
-  </Card>
-  <Card title="StripPrefix" icon="scissors">
-    Wraps `http.StripPrefix` as a chi-compatible middleware factory. Strips the given path prefix before passing the request to the next handler.
+```go
+func RouteHeaders() HeaderRouter
+```
 
-    ```go
-    r.Use(middleware.StripPrefix("/api/v1"))
-    ```
-  </Card>
-</CardGroup>
+Returns an empty `HeaderRouter`, a header-based middleware router. Chain `.Route(header, match, middleware)` calls to dispatch requests to different middleware stacks based on a request header value. Supports wildcard matching (`*`). Call `.Handler` as the final middleware in the chain.
+
+Additional methods on `HeaderRouter`:
+
+- `Route(header, match string, middlewareHandler func(next http.Handler) http.Handler) HeaderRouter` — adds a route for a single match value or wildcard pattern.
+- `RouteAny(header string, match []string, middlewareHandler func(next http.Handler) http.Handler) HeaderRouter` — adds a route that matches any one of several values.
+- `RouteDefault(handler func(next http.Handler) http.Handler) HeaderRouter` — sets the fallback middleware when no other route matches.
+- `Handler(next http.Handler) http.Handler` — the middleware entrypoint to pass to `r.Use(...)`.
+
+**Example**
+
+```go
+r.Use(middleware.RouteHeaders().
+    Route("Host", "api.example.com", apiMiddleware).
+    Route("Host", "*.example.com", subdomainMiddleware).
+    Handler)
+```
+
+</Accordion>

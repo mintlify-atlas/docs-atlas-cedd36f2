@@ -216,7 +216,7 @@ r.Use(middleware.AllowContentType("application/json", "application/xml"))
 
 ### AllowContentEncoding
 
-`AllowContentEncoding` enforces an allowlist of request `Content-Encoding` values, responding with `HTTP 415` for any encoding not in the list.
+`AllowContentEncoding` enforces an allowlist of request `Content-Encoding` values, responding with `HTTP 415 Unsupported Media Type` if an encoding is not permitted. Requests with no body (zero `Content-Length`) pass through without being checked.
 
 ```go signature
 func AllowContentEncoding(contentEncoding ...string) func(next http.Handler) http.Handler

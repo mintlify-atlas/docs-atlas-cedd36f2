@@ -225,7 +225,7 @@ r.With(rateLimiter, requireJSON, validateToken).Post("/api/items", createItem)
 
 ## The `middleware.New()` helper
 
-`middleware.New` converts any `http.Handler` — for example a pre-built handler from an external package — into a middleware function. The resulting middleware calls the provided handler for every request and then continues to the next handler in the chi chain.
+`middleware.New` converts any `http.Handler` into a middleware function. The resulting middleware calls the provided handler for every request and **does not call `next`** — the given handler is responsible for writing the full response. Use this when you have a standalone `http.Handler` (e.g., from a third-party package) that should handle requests completely rather than participate as a pass-through layer.
 
 ```go signature
 func New(h http.Handler) func(next http.Handler) http.Handler
@@ -241,16 +241,19 @@ import (
     "github.com/go-chi/chi/v5/middleware"
 )
 
-// externalHandler is some http.Handler from a third-party package.
-var externalHandler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-    // sets a header, records a metric, etc.
+// statusHandler is a self-contained http.Handler that writes its own response
+// and does not need to forward to downstream handlers.
+var statusHandler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusServiceUnavailable)
+    w.Write([]byte("maintenance mode"))
 })
 
 func main() {
     r := chi.NewRouter()
 
-    // Wrap externalHandler so it participates in the middleware chain.
-    r.Use(middleware.New(externalHandler))
+    // Wrap statusHandler as middleware. Because New() does not call next,
+    // all requests are handled by statusHandler and no routes are reached.
+    r.Use(middleware.New(statusHandler))
 
     r.Get("/", func(w http.ResponseWriter, r *http.Request) {
         w.Write([]byte("hello"))

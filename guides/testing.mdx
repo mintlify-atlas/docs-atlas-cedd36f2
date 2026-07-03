@@ -1,7 +1,7 @@
 ---
-title: "Testing chi Handlers and Routers in Go"
+title: "Testing chi HTTP Handlers, Middleware, and Routers in Go"
 sidebarTitle: "Testing"
-description: "Test chi HTTP handlers and routers using Go's httptest package — unit tests, router integration tests, URL param injection, and middleware behavior verification."
+description: "Test chi HTTP handlers and routers with Go's httptest package: unit tests, URL param injection, middleware checks, and end-to-end router tests."
 ---
 
 chi is built entirely on the standard `net/http` interface, which means you can test every handler, middleware, and router using only Go's built-in `net/http/httptest` package — no special testing framework needed. This guide walks through the core patterns chi itself uses internally and that you should use in your own services.

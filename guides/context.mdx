@@ -1,7 +1,7 @@
 ---
-title: "Using Go context.Context Effectively with chi"
+title: "How chi Uses Go context.Context: URL Params and Middleware"
 sidebarTitle: "Context"
-description: "Understand how chi uses Go's context.Context to store URL parameters, pass typed values through middleware chains, and handle cancellation and timeouts."
+description: "Understand how chi uses context.Context to store URL parameters, pass typed values through middleware chains, and handle request cancellation."
 ---
 
 Go's `context.Context` is the backbone of chi's request lifecycle. Every chi router stores its routing state — URL parameters, matched patterns, and the routing path — directly on the request context. Understanding how this works lets you write middleware and handlers that communicate cleanly without global state or function argument threading.

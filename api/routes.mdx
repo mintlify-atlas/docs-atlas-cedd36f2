@@ -163,13 +163,13 @@ fmt.Println(pattern) // "/articles/{id}"
 
 ## Route Struct
 
-Each element of the `[]Route` slice returned by `Routes()` has the following shape (from the chi tree package):
+Each element of the `[]Route` slice returned by `Routes()` has the following shape:
 
-```go title="tree.go (internal)"
+```go title="tree.go"
 type Route struct {
-    Pattern   string
-    Handlers  map[string]http.Handler
     SubRoutes Routes
+    Handlers  map[string]http.Handler
+    Pattern   string
 }
 ```
 
@@ -304,38 +304,61 @@ type ChainHandler struct {
 
 ---
 
-## Example: Using Routes for Documentation Generation
+## WalkFunc
 
-The `docgen` pattern — enumerating all registered routes programmatically — is a common use case for the `Routes` interface:
+```go title="tree.go"
+type WalkFunc func(method string, route string, handler http.Handler, middlewares ...func(http.Handler) http.Handler) error
+```
 
-```go title="docgen_example.go"
+`WalkFunc` is the callback type passed to `Walk`. It is called once per unique method-and-route combination in the router tree, including routes inside mounted sub-routers. Returning a non-nil error from the callback stops the walk and causes `Walk` to return that error.
+
+<ParamField path="method" type="string">
+  The HTTP method for this route entry, e.g. `"GET"` or `"POST"`.
+</ParamField>
+
+<ParamField path="route" type="string">
+  The full route pattern from the root, e.g. `"/api/v1/users/{id}"`.
+</ParamField>
+
+<ParamField path="handler" type="http.Handler">
+  The registered endpoint handler (after the middleware chain is stripped).
+</ParamField>
+
+<ParamField path="middlewares" type="...func(http.Handler) http.Handler">
+  All middleware functions that apply to this route, aggregated from the root through all sub-routers.
+</ParamField>
+
+---
+
+## Walk
+
+```go title="tree.go"
+func Walk(r Routes, walkFn WalkFunc) error
+```
+
+Walks the entire routing tree rooted at `r`, calling `walkFn` for every registered method-and-route pair. Sub-routers mounted via `Mount` or `Route` are traversed recursively. This is the primary mechanism for route introspection and API documentation generation.
+
+<ParamField path="r" type="Routes" required>
+  The router to walk. Any value that satisfies the `Routes` interface — typically a `*Mux`.
+</ParamField>
+
+<ParamField path="walkFn" type="WalkFunc" required>
+  The callback to invoke for each method-and-route pair.
+</ParamField>
+
+<ResponseField name="" type="error">
+  The first non-nil error returned by `walkFn`, or `nil` if the walk completes without error.
+</ResponseField>
+
+```go title="walk_example.go"
 package main
 
 import (
     "fmt"
     "net/http"
-    "strings"
 
     "github.com/go-chi/chi/v5"
 )
-
-func printRoutes(r chi.Router) {
-    walkFn := func(routes chi.Routes, prefix string) {
-        for _, route := range routes.Routes() {
-            for method := range route.Handlers {
-                if method == "*" {
-                    continue
-                }
-                fmt.Printf("%-8s %s%s\n", method, prefix, route.Pattern)
-            }
-            if route.SubRoutes != nil {
-                trimmed := strings.TrimSuffix(route.Pattern, "/*")
-                printRoutes(route.SubRoutes.(chi.Router), prefix+trimmed)
-            }
-        }
-    }
-    walkFn(r, "")
-}
 
 func main() {
     r := chi.NewRouter()
@@ -346,11 +369,44 @@ func main() {
         r.Get("/users/{id}", getUser)
     })
 
-    printRoutes(r)
+    // Walk the full router tree and print every route
+    chi.Walk(r, func(method, route string, handler http.Handler, middlewares ...func(http.Handler) http.Handler) error {
+        fmt.Printf("%-7s %s\n", method, route)
+        return nil
+    })
+
     http.ListenAndServe(":3000", r)
 }
+// Output:
+// GET     /
+// GET     /api/v1/users
+// POST    /api/v1/users
+// GET     /api/v1/users/{id}
 ```
 
 <Note>
-  The `docgen` package at `github.com/go-chi/chi/v5/docgen` provides production-ready helpers that walk the `Routes` tree and emit Markdown, JSON, or other formats. It relies entirely on the `Routes` interface — no reflection or code generation required.
+  The `docgen` package at `github.com/go-chi/chi/v5/docgen` provides production-ready helpers that walk the `Routes` tree and emit Markdown, JSON, or other formats. It relies entirely on the `Routes` interface and `Walk` — no reflection or code generation required.
 </Note>
+
+---
+
+## Example: Manual Route Traversal
+
+For cases where you need direct access to the `Route` struct (e.g. to inspect sub-routers or handlers individually), iterate `Routes()` recursively:
+
+```go title="traverse_example.go"
+func printRoutes(routes chi.Routes, prefix string) {
+    for _, route := range routes.Routes() {
+        for method := range route.Handlers {
+            if method == "*" {
+                continue
+            }
+            fmt.Printf("%-7s %s%s\n", method, prefix, route.Pattern)
+        }
+        if route.SubRoutes != nil {
+            trimmed := strings.TrimSuffix(route.Pattern, "/*")
+            printRoutes(route.SubRoutes, prefix+trimmed)
+        }
+    }
+}
+```
